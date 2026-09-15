@@ -69,5 +69,19 @@ df["month_cos"] = np.cos(
     2 * np.pi * df["month"] / 12
 )
 
+df = df.dropna(subset=[
+        "next_close",
+        "next_return",
+        "target",
+        "return_1d",
+        "return_5d",
+        "MA5",
+        "MA20",
+        "volatility_5d",
+        "volume_change",
+    ]).copy()
+
+
+
 
 print(df.head(30))
