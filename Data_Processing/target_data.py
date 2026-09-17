@@ -1,75 +1,59 @@
-import pandas as pd
 import numpy as np
-
-df = pd.read_csv('../SP500_Historical_Data_cleaned.csv')
-
-# Target
-df["next_close"] = df.groupby("Ticker")["Close"].shift(-1)
-
-df["next_return"] = (
-    df["next_close"] - df["Close"]
-) / df["Close"]
-
-df["target"] = (df["next_return"] > 0).astype(int)
+import pandas as pd
 
 
-# =========================
-# Feature Engineering
-# =========================
+def get_data():
 
-# 1. 1-day return
-df["return_1d"] = (
-    df.groupby("Ticker")["Close"].pct_change()
-)
+    df = pd.read_csv('SP500_Historical_Data_cleaned.csv')
 
-# 2. 5-day return
-df["return_5d"] = (
-    df.groupby("Ticker")["Close"].pct_change(5)
-)
+    # Target
+    df["next_close"] = df.groupby("Ticker")["Close"].shift(-1)
 
-# 3. Moving Average 5 days
-df["MA5"] = (
-    df.groupby("Ticker")["Close"]
-      .transform(lambda x: x.rolling(5).mean())
-)
+    df["next_return"] = (
+        df["next_close"] - df["Close"]
+    ) / df["Close"]
 
-# 4. Moving Average 20 days
-df["MA20"] = (
-    df.groupby("Ticker")["Close"]
-      .transform(lambda x: x.rolling(20).mean())
-)
+    df["target"] = (df["next_return"] > 0).astype(int)
 
-# 5. 5-day volatility
-df["volatility_5d"] = (
-    df.groupby("Ticker")["return_1d"]
-      .transform(lambda x: x.rolling(5).std())
-)
+    # Features
+    df["return_1d"] = df.groupby("Ticker")["Close"].pct_change()
 
-# 6. Volume change
-df["volume_change"] = (
-    df.groupby("Ticker")["Volume"].pct_change()
-)
+    df["return_5d"] = df.groupby("Ticker")["Close"].pct_change(5)
 
+    df["MA5"] = (
+        df.groupby("Ticker")["Close"]
+        .transform(lambda x: x.rolling(5).mean())
+    )
 
-# =========================
-# Seasonality Features
-# =========================
+    df["MA20"] = (
+        df.groupby("Ticker")["Close"]
+        .transform(lambda x: x.rolling(20).mean())
+    )
 
-df["Date"] = pd.to_datetime(df["Date"])
+    df["volatility_5d"] = (
+        df.groupby("Ticker")["return_1d"]
+        .transform(lambda x: x.rolling(5).std())
+    )
 
-# Month
-df["month"] = df["Date"].dt.month
+    df["volume_change"] = (
+        df.groupby("Ticker")["Volume"].pct_change()
+    )
 
-# Cyclical representation of month
-df["month_sin"] = np.sin(
-    2 * np.pi * df["month"] / 12
-)
+    df["Date"] = pd.to_datetime(df["Date"])
 
-df["month_cos"] = np.cos(
-    2 * np.pi * df["month"] / 12
-)
+    df["month"] = df["Date"].dt.month
 
-df = df.dropna(subset=[
+    df["month_sin"] = np.sin(
+        2 * np.pi * df["month"] / 12
+    )
+
+    df["month_cos"] = np.cos(
+        2 * np.pi * df["month"] / 12
+    )
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    df = df.dropna(subset=[
         "next_close",
         "next_return",
         "target",
@@ -81,7 +65,4 @@ df = df.dropna(subset=[
         "volume_change",
     ]).copy()
 
-
-
-
-print(df.head(30))
+    return df
