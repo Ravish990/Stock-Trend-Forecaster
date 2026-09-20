@@ -153,7 +153,7 @@ def train_model():
     train_loader = DataLoader(
         train_dataset,
         batch_size=64,
-        shuffle=True
+        shuffle=False
     )
 
     test_loader = DataLoader(
@@ -223,7 +223,9 @@ def train_model():
             )
 
             # Combined loss
-            loss = price_loss + direction_loss
+            alpha = 0.01
+            beta = 1.0
+            loss = alpha * price_loss + beta * direction_loss
 
             # Backpropagation
             optimizer.zero_grad()
@@ -240,6 +242,64 @@ def train_model():
             f"Epoch [{epoch+1}/{epochs}] "
             f"Loss: {average_loss:.4f}"
         )
+
+
+    model.eval()
+
+    total_price_squared_error = 0
+    total_correct = 0
+    total_samples = 0
+
+    with torch.no_grad():
+
+        for X_batch, price_batch, direction_batch in test_loader:
+
+            price_pred, direction_pred = model(X_batch)
+
+            price_pred = price_pred.squeeze(1)
+            direction_pred = direction_pred.squeeze(1)
+
+            # Price error
+            squared_error = (
+                price_pred - price_batch
+            ) ** 2
+
+            total_price_squared_error += (
+                squared_error.sum().item()
+            )
+
+            # Direction prediction
+            direction_probability = torch.sigmoid(
+                direction_pred
+            )
+
+            direction_prediction = (
+                direction_probability >= 0.5
+            ).float()
+
+            total_correct += (
+                direction_prediction == direction_batch
+            ).sum().item()
+
+            total_samples += direction_batch.size(0)
+
+    # RMSE
+    rmse = np.sqrt(
+        total_price_squared_error / total_samples
+    )
+
+    # Accuracy
+    directional_accuracy = (
+        total_correct / total_samples
+    ) * 100
+
+    print("\n===== TEST RESULTS =====")
+    print(f"Price RMSE: {rmse:.4f}")
+    print(
+        f"Directional Accuracy: "
+        f"{directional_accuracy:.2f}%"
+    )
+
 
     return model
 
