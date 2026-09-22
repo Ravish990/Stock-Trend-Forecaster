@@ -2,12 +2,23 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
 
 from Data_Processing.target_data import get_data
 from Model.model import LSTMModel
 
 
-def create_sequences(df, features, sequence_length=20):
+# ============================================================
+# Create Sequences With Date Filtering
+# ============================================================
+
+def create_sequences_with_date_filter(
+    df,
+    features,
+    sequence_length=20,
+    min_target_date=None,
+    max_target_date=None
+):
 
     X_sequences = []
     price_targets = []
@@ -15,21 +26,38 @@ def create_sequences(df, features, sequence_length=20):
 
     for ticker, group in df.groupby("Ticker"):
 
-        group = group.sort_values("Date")
+        group = group.sort_values("Date").reset_index(drop=True)
 
         X = group[features].values
 
         prices = group["next_close"].values
         directions = group["target"].values
+        target_dates = group["next_date"].values
 
         for i in range(sequence_length, len(group)):
 
-            # Previous 20 days
+            target_date = target_dates[i]
+
+            # -----------------------------------------------
+            # Filter target dates
+            # -----------------------------------------------
+
+            if min_target_date is not None:
+                if target_date < np.datetime64(min_target_date):
+                    continue
+
+            if max_target_date is not None:
+                if target_date >= np.datetime64(max_target_date):
+                    continue
+
+            # -----------------------------------------------
+            # Create sequence
+            # -----------------------------------------------
+
             X_sequences.append(
                 X[i-sequence_length:i]
             )
 
-            # Target for the next day
             price_targets.append(
                 prices[i]
             )
@@ -45,9 +73,117 @@ def create_sequences(df, features, sequence_length=20):
     )
 
 
+# ============================================================
+# Evaluation Function
+# ============================================================
+
+def evaluate_model(
+    model,
+    data_loader
+):
+
+    model.eval()
+
+    total_squared_error = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    with torch.no_grad():
+
+        for (
+            X_batch,
+            price_batch,
+            direction_batch
+        ) in data_loader:
+
+            # -----------------------------------------------
+            # Prediction
+            # -----------------------------------------------
+
+            price_pred, direction_pred = model(
+                X_batch
+            )
+
+            price_pred = price_pred.squeeze(1)
+            direction_pred = direction_pred.squeeze(1)
+
+            # -----------------------------------------------
+            # Price RMSE
+            # -----------------------------------------------
+
+            squared_error = (
+                price_pred - price_batch
+            ) ** 2
+
+            total_squared_error += (
+                squared_error.sum().item()
+            )
+
+            # -----------------------------------------------
+            # Direction Accuracy
+            # -----------------------------------------------
+
+            direction_probability = torch.sigmoid(
+                direction_pred
+            )
+
+            direction_prediction = (
+                direction_probability >= 0.5
+            ).float()
+
+            total_correct += (
+                direction_prediction == direction_batch
+            ).sum().item()
+
+            total_samples += direction_batch.size(0)
+
+    # -----------------------------------------------
+    # Metrics
+    # -----------------------------------------------
+
+    rmse = np.sqrt(
+        total_squared_error / total_samples
+    )
+
+    directional_accuracy = (
+        total_correct / total_samples
+    ) * 100
+
+    return rmse, directional_accuracy
+
+
+# ============================================================
+# Training
+# ============================================================
+
 def train_model():
 
+    # ========================================================
+    # Load Already-Cleaned Data
+    # ========================================================
+
     df = get_data()
+
+    # Date conversion
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    # Sort data
+    df = df.sort_values(
+        ["Ticker", "Date"]
+    ).reset_index(drop=True)
+
+    # ========================================================
+    # Create Next Target Date
+    # ========================================================
+
+    df["next_date"] = (
+        df.groupby("Ticker")["Date"]
+        .shift(-1)
+    )
+
+    # ========================================================
+    # Features
+    # ========================================================
 
     features = [
         "return_1d",
@@ -60,45 +196,158 @@ def train_model():
         "month_cos"
     ]
 
-    # Make sure data is sorted
-    df = df.sort_values(["Ticker", "Date"])
+    # ========================================================
+    # Split Dates
+    # ========================================================
 
-    # =========================
-    # Train-Test Split
-    # =========================
+    validation_start = pd.Timestamp("2012-01-01")
+    test_start = pd.Timestamp("2015-01-01")
 
-    split_date = pd.Timestamp("2002-01-01")
+    # ========================================================
+    # Training Data
+    # ========================================================
 
-    train_df = df[df["Date"] < split_date].copy()
-    test_df = df[df["Date"] >= split_date].copy()
+    train_rows = df[
+        df["Date"] < validation_start
+    ].copy()
 
-    # =========================
-    # Create Sequences
-    # =========================
+    # ========================================================
+    # Feature Scaling
+    # ========================================================
+    #
+    # Fit ONLY on training data
+    # ========================================================
 
-    X_train, price_train, direction_train = create_sequences(
-        train_df,
-        features,
-        sequence_length=20
+    scaler = StandardScaler()
+
+    scaler.fit(
+        train_rows[features]
     )
 
-    X_test, price_test, direction_test = create_sequences(
-        test_df,
-        features,
-        sequence_length=20
+    # Apply the training scaler to all data
+
+    df[features] = scaler.transform(
+        df[features]
     )
+
+    # ========================================================
+    # Training Sequences
+    # ========================================================
+
+    X_train, price_train, direction_train = (
+        create_sequences_with_date_filter(
+            df,
+            features,
+            sequence_length=20,
+            min_target_date=None,
+            max_target_date=validation_start
+        )
+    )
+
+    # ========================================================
+    # Validation Context
+    # ========================================================
+    #
+    # Last 20 observations before validation period
+    # are used as input context.
+    # ========================================================
+
+    validation_context = (
+        df[
+            df["Date"] < validation_start
+        ]
+        .groupby("Ticker")
+        .tail(20)
+    )
+
+    validation_data = df[
+        (df["Date"] >= validation_start) &
+        (df["Date"] < test_start)
+    ]
+
+    validation_sequence_df = pd.concat(
+        [
+            validation_context,
+            validation_data
+        ]
+    )
+
+    validation_sequence_df = (
+        validation_sequence_df
+        .sort_values(["Ticker", "Date"])
+        .reset_index(drop=True)
+    )
+
+    X_val, price_val, direction_val = (
+        create_sequences_with_date_filter(
+            validation_sequence_df,
+            features,
+            sequence_length=20,
+            min_target_date=validation_start,
+            max_target_date=test_start
+        )
+    )
+
+    # ========================================================
+    # Test Context
+    # ========================================================
+
+    test_context = (
+        df[
+            df["Date"] < test_start
+        ]
+        .groupby("Ticker")
+        .tail(20)
+    )
+
+    test_data = df[
+        df["Date"] >= test_start
+    ]
+
+    test_sequence_df = pd.concat(
+        [
+            test_context,
+            test_data
+        ]
+    )
+
+    test_sequence_df = (
+        test_sequence_df
+        .sort_values(["Ticker", "Date"])
+        .reset_index(drop=True)
+    )
+
+    X_test, price_test, direction_test = (
+        create_sequences_with_date_filter(
+            test_sequence_df,
+            features,
+            sequence_length=20,
+            min_target_date=test_start,
+            max_target_date=None
+        )
+    )
+
+    # ========================================================
+    # Print Shapes
+    # ========================================================
+
+    print("\n===== DATA SHAPES =====")
 
     print("X_train:", X_train.shape)
     print("Price train:", price_train.shape)
     print("Direction train:", direction_train.shape)
 
+    print("X_val:", X_val.shape)
+    print("Price val:", price_val.shape)
+    print("Direction val:", direction_val.shape)
+
     print("X_test:", X_test.shape)
     print("Price test:", price_test.shape)
     print("Direction test:", direction_test.shape)
 
-    # =========================
-    # Convert to PyTorch tensors
-    # =========================
+    # ========================================================
+    # Convert To PyTorch
+    # ========================================================
 
     X_train = torch.tensor(
         X_train,
@@ -112,6 +361,21 @@ def train_model():
 
     direction_train = torch.tensor(
         direction_train,
+        dtype=torch.float32
+    )
+
+    X_val = torch.tensor(
+        X_val,
+        dtype=torch.float32
+    )
+
+    price_val = torch.tensor(
+        price_val,
+        dtype=torch.float32
+    )
+
+    direction_val = torch.tensor(
+        direction_val,
         dtype=torch.float32
     )
 
@@ -130,14 +394,20 @@ def train_model():
         dtype=torch.float32
     )
 
-    # =========================
+    # ========================================================
     # Dataset
-    # =========================
+    # ========================================================
 
     train_dataset = TensorDataset(
         X_train,
         price_train,
         direction_train
+    )
+
+    val_dataset = TensorDataset(
+        X_val,
+        price_val,
+        direction_val
     )
 
     test_dataset = TensorDataset(
@@ -146,12 +416,18 @@ def train_model():
         direction_test
     )
 
-    # =========================
+    # ========================================================
     # DataLoader
-    # =========================
+    # ========================================================
 
     train_loader = DataLoader(
         train_dataset,
+        batch_size=64,
+        shuffle=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=64,
         shuffle=False
     )
@@ -162,9 +438,9 @@ def train_model():
         shuffle=False
     )
 
-    # =========================
-    # Create Model
-    # =========================
+    # ========================================================
+    # Model
+    # ========================================================
 
     model = LSTMModel(
         input_size=8,
@@ -173,45 +449,72 @@ def train_model():
         dropout=0.2
     )
 
-    # =========================
+    # ========================================================
     # Loss Functions
-    # =========================
+    # ========================================================
 
     price_loss_fn = torch.nn.MSELoss()
 
-    direction_loss_fn = torch.nn.BCEWithLogitsLoss()
+    direction_loss_fn = (
+        torch.nn.BCEWithLogitsLoss()
+    )
 
-    # =========================
+    # ========================================================
     # Optimizer
-    # =========================
+    # ========================================================
 
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=0.001
     )
 
-    # =========================
-    # Training
-    # =========================
+    # ========================================================
+    # Training Settings
+    # ========================================================
 
-    epochs = 10
+    epochs = 50
+
+    alpha = 0.01
+    beta = 1.0
+
+    # Early stopping
+    patience = 5
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    model_path = "best_lstm_stock_model.pth"
+
+    # ========================================================
+    # Training Loop
+    # ========================================================
 
     for epoch in range(epochs):
 
         model.train()
 
-        total_loss = 0
+        total_train_loss = 0.0
 
-        for X_batch, price_batch, direction_batch in train_loader:
+        for (
+            X_batch,
+            price_batch,
+            direction_batch
+        ) in train_loader:
 
-            # Forward pass
-            price_pred, direction_pred = model(X_batch)
+            # -----------------------------------------------
+            # Forward Pass
+            # -----------------------------------------------
 
-            # Remove extra dimension
+            price_pred, direction_pred = model(
+                X_batch
+            )
+
             price_pred = price_pred.squeeze(1)
             direction_pred = direction_pred.squeeze(1)
 
-            # Calculate losses
+            # -----------------------------------------------
+            # Loss
+            # -----------------------------------------------
+
             price_loss = price_loss_fn(
                 price_pred,
                 price_batch
@@ -222,86 +525,210 @@ def train_model():
                 direction_batch
             )
 
-            # Combined loss
-            alpha = 0.01
-            beta = 1.0
-            loss = alpha * price_loss + beta * direction_loss
+            loss = (
+                alpha * price_loss
+                + beta * direction_loss
+            )
 
+            # -----------------------------------------------
             # Backpropagation
+            # -----------------------------------------------
+
             optimizer.zero_grad()
 
             loss.backward()
 
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0
+            )
+
             optimizer.step()
 
-            total_loss += loss.item()
+            total_train_loss += loss.item()
 
-        average_loss = total_loss / len(train_loader)
-
-        print(
-            f"Epoch [{epoch+1}/{epochs}] "
-            f"Loss: {average_loss:.4f}"
+        average_train_loss = (
+            total_train_loss / len(train_loader)
         )
 
+        # ====================================================
+        # Validation Loss
+        # ====================================================
 
-    model.eval()
+        model.eval()
 
-    total_price_squared_error = 0
-    total_correct = 0
-    total_samples = 0
+        total_val_loss = 0.0
 
-    with torch.no_grad():
+        with torch.no_grad():
 
-        for X_batch, price_batch, direction_batch in test_loader:
+            for (
+                X_batch,
+                price_batch,
+                direction_batch
+            ) in val_loader:
 
-            price_pred, direction_pred = model(X_batch)
+                price_pred, direction_pred = model(
+                    X_batch
+                )
 
-            price_pred = price_pred.squeeze(1)
-            direction_pred = direction_pred.squeeze(1)
+                price_pred = price_pred.squeeze(1)
+                direction_pred = direction_pred.squeeze(1)
 
-            # Price error
-            squared_error = (
-                price_pred - price_batch
-            ) ** 2
+                price_loss = price_loss_fn(
+                    price_pred,
+                    price_batch
+                )
 
-            total_price_squared_error += (
-                squared_error.sum().item()
+                direction_loss = direction_loss_fn(
+                    direction_pred,
+                    direction_batch
+                )
+
+                val_loss = (
+                    alpha * price_loss
+                    + beta * direction_loss
+                )
+
+                total_val_loss += (
+                    val_loss.item()
+                )
+
+        average_val_loss = (
+            total_val_loss / len(val_loader)
+        )
+
+        # ====================================================
+        # Validation Metrics
+        # ====================================================
+
+        val_rmse, val_accuracy = evaluate_model(
+            model,
+            val_loader
+        )
+
+        # ====================================================
+        # Print Results
+        # ====================================================
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] "
+            f"Train Loss: {average_train_loss:.4f} "
+            f"Val Loss: {average_val_loss:.4f} "
+            f"Val RMSE: {val_rmse:.4f} "
+            f"Val Accuracy: {val_accuracy:.2f}%"
+        )
+
+        # ====================================================
+        # Save Best Model
+        # ====================================================
+
+        if average_val_loss < best_val_loss:
+
+            best_val_loss = average_val_loss
+
+            patience_counter = 0
+
+            torch.save(
+                model.state_dict(),
+                model_path
             )
 
-            # Direction prediction
-            direction_probability = torch.sigmoid(
-                direction_pred
+            print(
+                "  -> Best model saved."
             )
 
-            direction_prediction = (
-                direction_probability >= 0.5
-            ).float()
+        else:
 
-            total_correct += (
-                direction_prediction == direction_batch
-            ).sum().item()
+            patience_counter += 1
 
-            total_samples += direction_batch.size(0)
+            print(
+                f"  -> No improvement "
+                f"({patience_counter}/{patience})"
+            )
 
-    # RMSE
-    rmse = np.sqrt(
-        total_price_squared_error / total_samples
+        # ====================================================
+        # Early Stopping
+        # ====================================================
+
+        if patience_counter >= patience:
+
+            print(
+                "\nEarly stopping triggered."
+            )
+
+            break
+
+    # ========================================================
+    # Load Best Model
+    # ========================================================
+
+    print(
+        "\nLoading best model..."
     )
 
-    # Accuracy
-    directional_accuracy = (
-        total_correct / total_samples
-    ) * 100
+    model.load_state_dict(
+        torch.load(
+            model_path,
+            weights_only=True
+        )
+    )
+
+    # ========================================================
+    # Final Validation Results
+    # ========================================================
+
+    val_rmse, val_accuracy = evaluate_model(
+        model,
+        val_loader
+    )
+
+    # ========================================================
+    # Final Test Results
+    # ========================================================
+
+    test_rmse, test_accuracy = evaluate_model(
+        model,
+        test_loader
+    )
+
+    # ========================================================
+    # Results
+    # ========================================================
+
+    print("\n===== VALIDATION RESULTS =====")
+
+    print(
+        f"Validation RMSE: {val_rmse:.4f}"
+    )
+
+    print(
+        f"Validation Directional Accuracy: "
+        f"{val_accuracy:.2f}%"
+    )
 
     print("\n===== TEST RESULTS =====")
-    print(f"Price RMSE: {rmse:.4f}")
+
     print(
-        f"Directional Accuracy: "
-        f"{directional_accuracy:.2f}%"
+        f"Test Price RMSE: {test_rmse:.4f}"
     )
 
+    print(
+        f"Test Directional Accuracy: "
+        f"{test_accuracy:.2f}%"
+    )
+
+    print(
+        f"\nBest model saved to: {model_path}"
+    )
 
     return model
 
+
+# ============================================================
+# Main
+# ============================================================
+
 if __name__ == "__main__":
+
     model = train_model()
