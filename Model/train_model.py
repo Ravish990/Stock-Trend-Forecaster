@@ -21,7 +21,7 @@ def create_sequences_with_date_filter(
 ):
 
     X_sequences = []
-    price_targets = []
+    return_targets = []
     direction_targets = []
 
     for ticker, group in df.groupby("Ticker"):
@@ -30,7 +30,7 @@ def create_sequences_with_date_filter(
 
         X = group[features].values
 
-        prices = group["next_close"].values
+        returns = group["next_return"].values
         directions = group["target"].values
         target_dates = group["next_date"].values
 
@@ -41,6 +41,9 @@ def create_sequences_with_date_filter(
             # -----------------------------------------------
             # Filter target dates
             # -----------------------------------------------
+
+            if pd.isna(target_date):
+                continue
 
             if min_target_date is not None:
                 if target_date < np.datetime64(min_target_date):
@@ -58,8 +61,8 @@ def create_sequences_with_date_filter(
                 X[i-sequence_length:i]
             )
 
-            price_targets.append(
-                prices[i]
+            return_targets.append(
+                returns[i]
             )
 
             direction_targets.append(
@@ -68,7 +71,7 @@ def create_sequences_with_date_filter(
 
     return (
         np.array(X_sequences),
-        np.array(price_targets),
+        np.array(return_targets),
         np.array(direction_targets)
     )
 
@@ -92,7 +95,7 @@ def evaluate_model(
 
         for (
             X_batch,
-            price_batch,
+            return_batch,
             direction_batch
         ) in data_loader:
 
@@ -100,19 +103,19 @@ def evaluate_model(
             # Prediction
             # -----------------------------------------------
 
-            price_pred, direction_pred = model(
+            return_pred, direction_pred = model(
                 X_batch
             )
 
-            price_pred = price_pred.squeeze(1)
+            return_pred = return_pred.squeeze(1)
             direction_pred = direction_pred.squeeze(1)
 
             # -----------------------------------------------
-            # Price RMSE
+            # Return RMSE
             # -----------------------------------------------
 
             squared_error = (
-                price_pred - price_batch
+                return_pred - return_batch
             ) ** 2
 
             total_squared_error += (
@@ -184,12 +187,21 @@ def train_model():
     # ========================================================
     # Features
     # ========================================================
+    #
+    # MA5 / MA20 were dropped in favor of price-relative,
+    # stationary versions (price_to_MA5, price_to_MA20,
+    # MA5_to_MA20) computed in target_data.get_data(). Raw
+    # moving averages are in price units and differ wildly
+    # across tickers, which let the model partly infer price
+    # level instead of learning direction.
+    # ========================================================
 
     features = [
         "return_1d",
         "return_5d",
-        "MA5",
-        "MA20",
+        "price_to_MA5",
+        "price_to_MA20",
+        "MA5_to_MA20",
         "volatility_5d",
         "volume_change",
         "month_sin",
@@ -234,7 +246,7 @@ def train_model():
     # Training Sequences
     # ========================================================
 
-    X_train, price_train, direction_train = (
+    X_train, return_train, direction_train = (
         create_sequences_with_date_filter(
             df,
             features,
@@ -278,7 +290,7 @@ def train_model():
         .reset_index(drop=True)
     )
 
-    X_val, price_val, direction_val = (
+    X_val, return_val, direction_val = (
         create_sequences_with_date_filter(
             validation_sequence_df,
             features,
@@ -317,7 +329,7 @@ def train_model():
         .reset_index(drop=True)
     )
 
-    X_test, price_test, direction_test = (
+    X_test, return_test, direction_test = (
         create_sequences_with_date_filter(
             test_sequence_df,
             features,
@@ -334,65 +346,32 @@ def train_model():
     print("\n===== DATA SHAPES =====")
 
     print("X_train:", X_train.shape)
-    print("Price train:", price_train.shape)
+    print("Return train:", return_train.shape)
     print("Direction train:", direction_train.shape)
 
     print("X_val:", X_val.shape)
-    print("Price val:", price_val.shape)
+    print("Return val:", return_val.shape)
     print("Direction val:", direction_val.shape)
 
     print("X_test:", X_test.shape)
-    print("Price test:", price_test.shape)
+    print("Return test:", return_test.shape)
     print("Direction test:", direction_test.shape)
 
     # ========================================================
     # Convert To PyTorch
     # ========================================================
 
-    X_train = torch.tensor(
-        X_train,
-        dtype=torch.float32
-    )
+    X_train = torch.tensor(X_train, dtype=torch.float32)
+    return_train = torch.tensor(return_train, dtype=torch.float32)
+    direction_train = torch.tensor(direction_train, dtype=torch.float32)
 
-    price_train = torch.tensor(
-        price_train,
-        dtype=torch.float32
-    )
+    X_val = torch.tensor(X_val, dtype=torch.float32)
+    return_val = torch.tensor(return_val, dtype=torch.float32)
+    direction_val = torch.tensor(direction_val, dtype=torch.float32)
 
-    direction_train = torch.tensor(
-        direction_train,
-        dtype=torch.float32
-    )
-
-    X_val = torch.tensor(
-        X_val,
-        dtype=torch.float32
-    )
-
-    price_val = torch.tensor(
-        price_val,
-        dtype=torch.float32
-    )
-
-    direction_val = torch.tensor(
-        direction_val,
-        dtype=torch.float32
-    )
-
-    X_test = torch.tensor(
-        X_test,
-        dtype=torch.float32
-    )
-
-    price_test = torch.tensor(
-        price_test,
-        dtype=torch.float32
-    )
-
-    direction_test = torch.tensor(
-        direction_test,
-        dtype=torch.float32
-    )
+    X_test = torch.tensor(X_test, dtype=torch.float32)
+    return_test = torch.tensor(return_test, dtype=torch.float32)
+    direction_test = torch.tensor(direction_test, dtype=torch.float32)
 
     # ========================================================
     # Dataset
@@ -400,19 +379,19 @@ def train_model():
 
     train_dataset = TensorDataset(
         X_train,
-        price_train,
+        return_train,
         direction_train
     )
 
     val_dataset = TensorDataset(
         X_val,
-        price_val,
+        return_val,
         direction_val
     )
 
     test_dataset = TensorDataset(
         X_test,
-        price_test,
+        return_test,
         direction_test
     )
 
@@ -441,9 +420,13 @@ def train_model():
     # ========================================================
     # Model
     # ========================================================
+    #
+    # input_size = len(features) = 9 now (added price_to_MA5,
+    # price_to_MA20, MA5_to_MA20; removed raw MA5, MA20).
+    # ========================================================
 
     model = LSTMModel(
-        input_size=8,
+        input_size=len(features),
         hidden_size=64,
         num_layers=2,
         dropout=0.2
@@ -453,7 +436,7 @@ def train_model():
     # Loss Functions
     # ========================================================
 
-    price_loss_fn = torch.nn.MSELoss()
+    return_loss_fn = torch.nn.MSELoss()
 
     direction_loss_fn = (
         torch.nn.BCEWithLogitsLoss()
@@ -468,17 +451,32 @@ def train_model():
         lr=0.001
     )
 
+    # Reduce LR when validation loss plateaus, so training
+    # doesn't stall at a mediocre minimum for the remaining
+    # patience epochs before early stopping kicks in.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=2
+    )
+
     # ========================================================
     # Training Settings
     # ========================================================
 
     epochs = 50
 
-    alpha = 0.01
+    # Returns are tiny numbers (~1e-2 scale), so their squared
+    # error is naturally much smaller than the BCE direction
+    # loss. alpha is raised from 0.01 so the return loss still
+    # contributes meaningfully to the gradient instead of being
+    # drowned out by direction loss alone.
+    alpha = 0.5
     beta = 1.0
 
     # Early stopping
-    patience = 5
+    patience = 7
     best_val_loss = float("inf")
     patience_counter = 0
 
@@ -496,7 +494,7 @@ def train_model():
 
         for (
             X_batch,
-            price_batch,
+            return_batch,
             direction_batch
         ) in train_loader:
 
@@ -504,20 +502,20 @@ def train_model():
             # Forward Pass
             # -----------------------------------------------
 
-            price_pred, direction_pred = model(
+            return_pred, direction_pred = model(
                 X_batch
             )
 
-            price_pred = price_pred.squeeze(1)
+            return_pred = return_pred.squeeze(1)
             direction_pred = direction_pred.squeeze(1)
 
             # -----------------------------------------------
             # Loss
             # -----------------------------------------------
 
-            price_loss = price_loss_fn(
-                price_pred,
-                price_batch
+            return_loss = return_loss_fn(
+                return_pred,
+                return_batch
             )
 
             direction_loss = direction_loss_fn(
@@ -526,7 +524,7 @@ def train_model():
             )
 
             loss = (
-                alpha * price_loss
+                alpha * return_loss
                 + beta * direction_loss
             )
 
@@ -564,20 +562,20 @@ def train_model():
 
             for (
                 X_batch,
-                price_batch,
+                return_batch,
                 direction_batch
             ) in val_loader:
 
-                price_pred, direction_pred = model(
+                return_pred, direction_pred = model(
                     X_batch
                 )
 
-                price_pred = price_pred.squeeze(1)
+                return_pred = return_pred.squeeze(1)
                 direction_pred = direction_pred.squeeze(1)
 
-                price_loss = price_loss_fn(
-                    price_pred,
-                    price_batch
+                return_loss = return_loss_fn(
+                    return_pred,
+                    return_batch
                 )
 
                 direction_loss = direction_loss_fn(
@@ -586,7 +584,7 @@ def train_model():
                 )
 
                 val_loss = (
-                    alpha * price_loss
+                    alpha * return_loss
                     + beta * direction_loss
                 )
 
@@ -597,6 +595,8 @@ def train_model():
         average_val_loss = (
             total_val_loss / len(val_loader)
         )
+
+        scheduler.step(average_val_loss)
 
         # ====================================================
         # Validation Metrics
@@ -611,12 +611,15 @@ def train_model():
         # Print Results
         # ====================================================
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
         print(
             f"Epoch [{epoch + 1}/{epochs}] "
-            f"Train Loss: {average_train_loss:.4f} "
-            f"Val Loss: {average_val_loss:.4f} "
-            f"Val RMSE: {val_rmse:.4f} "
-            f"Val Accuracy: {val_accuracy:.2f}%"
+            f"Train Loss: {average_train_loss:.5f} "
+            f"Val Loss: {average_val_loss:.5f} "
+            f"Val Return RMSE: {val_rmse:.5f} "
+            f"Val Accuracy: {val_accuracy:.2f}% "
+            f"LR: {current_lr:.6f}"
         )
 
         # ====================================================
@@ -699,7 +702,7 @@ def train_model():
     print("\n===== VALIDATION RESULTS =====")
 
     print(
-        f"Validation RMSE: {val_rmse:.4f}"
+        f"Validation Return RMSE: {val_rmse:.5f}"
     )
 
     print(
@@ -710,7 +713,7 @@ def train_model():
     print("\n===== TEST RESULTS =====")
 
     print(
-        f"Test Price RMSE: {test_rmse:.4f}"
+        f"Test Return RMSE: {test_rmse:.5f}"
     )
 
     print(

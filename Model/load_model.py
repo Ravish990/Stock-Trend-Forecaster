@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from Data_Processing.target_data import get_data
 from Model.model import LSTMModel
+import matplotlib.pyplot as plt
 
 
 # ============================================================
@@ -115,16 +116,23 @@ def create_sequences_with_date_filter(
 
 def evaluate_model(
     model,
-    data_loader
+    data_loader,
+    plot=False,
+    n_points=200
 ):
-
     model.eval()
 
     total_squared_error = 0.0
 
     total_correct = 0
-
     total_samples = 0
+
+    # Store predictions for graph
+    actual_prices = []
+    predicted_prices = []
+
+    actual_directions = []
+    predicted_directions = []
 
     with torch.no_grad():
 
@@ -134,16 +142,19 @@ def evaluate_model(
             direction_batch
         ) in data_loader:
 
+            # ---------------------------------------------
             # Move data to CPU/GPU
+            # ---------------------------------------------
+
             X_batch = X_batch.to(device)
 
             price_batch = price_batch.to(device)
 
             direction_batch = direction_batch.to(device)
 
-            # ------------------------------------------------
+            # ---------------------------------------------
             # Model prediction
-            # ------------------------------------------------
+            # ---------------------------------------------
 
             price_pred, direction_pred = model(
                 X_batch
@@ -153,9 +164,9 @@ def evaluate_model(
 
             direction_pred = direction_pred.squeeze(1)
 
-            # ------------------------------------------------
+            # ---------------------------------------------
             # Price error
-            # ------------------------------------------------
+            # ---------------------------------------------
 
             squared_error = (
                 price_pred - price_batch
@@ -165,9 +176,21 @@ def evaluate_model(
                 squared_error.sum().item()
             )
 
-            # ------------------------------------------------
+            # ---------------------------------------------
+            # Store price predictions
+            # ---------------------------------------------
+
+            actual_prices.extend(
+                price_batch.cpu().numpy()
+            )
+
+            predicted_prices.extend(
+                price_pred.cpu().numpy()
+            )
+
+            # ---------------------------------------------
             # Direction prediction
-            # ------------------------------------------------
+            # ---------------------------------------------
 
             direction_probability = torch.sigmoid(
                 direction_pred
@@ -177,6 +200,10 @@ def evaluate_model(
                 direction_probability >= 0.5
             ).float()
 
+            # ---------------------------------------------
+            # Calculate correct predictions
+            # ---------------------------------------------
+
             total_correct += (
                 direction_prediction == direction_batch
             ).sum().item()
@@ -185,26 +212,122 @@ def evaluate_model(
                 direction_batch.size(0)
             )
 
-    # --------------------------------------------------------
+            # ---------------------------------------------
+            # Store direction predictions
+            # ---------------------------------------------
+
+            actual_directions.extend(
+                direction_batch.cpu().numpy()
+            )
+
+            predicted_directions.extend(
+                direction_prediction.cpu().numpy()
+            )
+
+    # -----------------------------------------------------
+    # Convert lists to NumPy arrays
+    # -----------------------------------------------------
+
+    actual_prices = np.array(actual_prices)
+
+    predicted_prices = np.array(predicted_prices)
+
+    actual_directions = np.array(
+        actual_directions
+    )
+
+    predicted_directions = np.array(
+        predicted_directions
+    )
+
+    # -----------------------------------------------------
     # Calculate RMSE
-    # --------------------------------------------------------
+    # -----------------------------------------------------
 
     rmse = np.sqrt(
         total_squared_error /
         total_samples
     )
 
-    # --------------------------------------------------------
+    # -----------------------------------------------------
     # Calculate directional accuracy
-    # --------------------------------------------------------
+    # -----------------------------------------------------
 
     directional_accuracy = (
         total_correct /
         total_samples
     ) * 100
 
-    return rmse, directional_accuracy
+    # -----------------------------------------------------
+    # Print results
+    # -----------------------------------------------------
 
+    print(
+        f"Test Price RMSE: {rmse:.4f}"
+    )
+
+    print(
+        f"Test Directional Accuracy: "
+        f"{directional_accuracy:.2f}%"
+    )
+
+    # -----------------------------------------------------
+    # Plot Actual vs Predicted
+    # -----------------------------------------------------
+
+    if plot:
+
+        import matplotlib.pyplot as plt
+
+        n_points = min(
+            n_points,
+            len(actual_prices)
+        )
+
+        plt.figure(figsize=(14, 6))
+
+        plt.plot(
+            actual_prices[:n_points],
+            label="Actual Price"
+        )
+
+        plt.plot(
+            predicted_prices[:n_points],
+            label="Predicted Price"
+        )
+
+        plt.xlabel(
+            "Test Sample"
+        )
+
+        plt.ylabel(
+            "Stock Price"
+        )
+
+        plt.title(
+            "Actual vs Predicted Stock Price"
+        )
+
+        plt.legend()
+
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        plt.show()
+
+    # -----------------------------------------------------
+    # Return everything
+    # -----------------------------------------------------
+
+    return (
+        rmse,
+        directional_accuracy,
+        actual_prices,
+        predicted_prices,
+        actual_directions,
+        predicted_directions
+    )
 
 # ============================================================
 # Main
@@ -506,12 +629,12 @@ def main():
         "\nEvaluating test data..."
     )
 
-    test_rmse, test_accuracy = (
-        evaluate_model(
-            model,
-            test_loader
-        )
-    )
+    rmse, accuracy, actual_prices, predicted_prices, _, _ = evaluate_model(
+    model,
+    test_loader,
+    plot=True,
+    n_points=200
+)
 
 
     # ========================================================
@@ -532,12 +655,12 @@ def main():
 
     print(
         f"Test Price RMSE: "
-        f"{test_rmse:.4f}"
+        f"{rmse:.4f}"
     )
 
     print(
         f"Test Directional Accuracy: "
-        f"{test_accuracy:.2f}%"
+        f"{accuracy:.2f}%"
     )
 
     print(

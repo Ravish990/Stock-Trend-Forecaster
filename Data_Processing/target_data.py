@@ -30,6 +30,11 @@ def get_data():
         .transform(lambda x: x.rolling(20).mean())
     )
 
+    # --- Relative (stationary) trend features, not raw price levels ---
+    df["price_to_MA5"] = df["Close"] / df["MA5"] - 1
+    df["price_to_MA20"] = df["Close"] / df["MA20"] - 1
+    df["MA5_to_MA20"] = df["MA5"] / df["MA20"] - 1
+
     df["volatility_5d"] = (
         df.groupby("Ticker")["return_1d"]
         .transform(lambda x: x.rolling(5).std())
@@ -43,13 +48,8 @@ def get_data():
 
     df["month"] = df["Date"].dt.month
 
-    df["month_sin"] = np.sin(
-        2 * np.pi * df["month"] / 12
-    )
-
-    df["month_cos"] = np.cos(
-        2 * np.pi * df["month"] / 12
-    )
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
@@ -59,8 +59,9 @@ def get_data():
         "target",
         "return_1d",
         "return_5d",
-        "MA5",
-        "MA20",
+        "price_to_MA5",
+        "price_to_MA20",
+        "MA5_to_MA20",
         "volatility_5d",
         "volume_change",
     ]).copy()

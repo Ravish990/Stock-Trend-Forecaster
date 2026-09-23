@@ -21,10 +21,17 @@ class LSTMModel(nn.Module):
             dropout=dropout
         )
 
-        # Price prediction
-        self.price_fc = nn.Linear(hidden_size, 1)
+        # nn.LSTM's internal dropout only applies BETWEEN stacked
+        # layers, not to the final hidden state that feeds the output
+        # heads. This dropout covers that gap.
+        self.dropout = nn.Dropout(dropout)
 
-        # Bullish / bearish prediction
+        # Return prediction (renamed from price_fc: this head predicts
+        # next_return, not raw next_close)
+        self.return_fc = nn.Linear(hidden_size, 1)
+
+        # Bullish / bearish prediction (raw logits, used with
+        # BCEWithLogitsLoss — no Sigmoid here)
         self.direction_fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
@@ -34,8 +41,9 @@ class LSTMModel(nn.Module):
         # Last time step
         last_output = output[:, -1, :]
 
-        price = self.price_fc(last_output)
+        last_output = self.dropout(last_output)
+        ret = self.return_fc(last_output)
 
         direction = self.direction_fc(last_output)
 
-        return price, direction
+        return ret, direction
