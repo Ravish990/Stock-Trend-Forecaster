@@ -1,607 +1,918 @@
-# ============================================================
-# Load Trained LSTM Model and Evaluate on Test Data
-# ============================================================
-
+import pickle
 import numpy as np
 import pandas as pd
 import torch
-
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
 
 from Data_Processing.target_data import get_data
 from Model.model import LSTMModel
-import matplotlib.pyplot as plt
+
+from Model.train_model import (
+    add_quant_features,
+    add_targets,
+    HORIZON,
+    SEQUENCE_LENGTH,
+    HIDDEN_SIZE,
+    NUM_LAYERS,
+    DROPOUT,
+    MODEL_PATH,
+    SCALER_PATH,
+)
 
 
 # ============================================================
-# Device
+# CONFIG
+# ============================================================
+
+PLOT_TICKER = "AAPL"
+
+# Last date whose ACTUAL data the model is allowed to see
+INPUT_DATE = "2026-02-18"
+
+# Number of future trading days to predict
+FORECAST_DAYS = 5
+
+
+# ============================================================
+# DEVICE
 # ============================================================
 
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
+print("=" * 70)
+print("5-DAY RECURSIVE STOCK PREDICTION")
+print("=" * 70)
+
 print("Using device:", device)
 
 
 # ============================================================
-# Create Sequences
-# Same logic used during training (train_model.py)
+# LOAD SCALER / FEATURE INFORMATION
 # ============================================================
 
-def create_sequences_with_date_filter(
+print("\nLoading scaler and feature information...")
+
+with open(SCALER_PATH, "rb") as f:
+    bundle = pickle.load(f)
+
+feature_scaler = bundle["feature_scaler"]
+target_scaler = bundle["target_scaler"]
+
+features = bundle["features"]
+sequence_length = bundle["sequence_length"]
+
+regression_target = bundle["regression_target"]
+direction_target = bundle["direction_target"]
+
+print(f"Number of features : {len(features)}")
+print(f"Sequence length    : {sequence_length}")
+print(f"Regression target  : {regression_target}")
+print(f"Direction target   : {direction_target}")
+
+
+print("\nFeatures used by model:")
+
+for i, feature in enumerate(features, 1):
+    print(f"{i:2}. {feature}")
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+print("\nLoading dataset...")
+
+df = get_data(horizon=HORIZON)
+
+print("Raw data shape:", df.shape)
+
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+print("\nAdding quantitative features...")
+
+df = add_quant_features(df)
+
+print("Adding targets...")
+
+df = add_targets(
     df,
-    features,
-    sequence_length=20,
-    min_target_date=None,
-    max_target_date=None
-):
+    horizon=HORIZON
+)
 
-    X_sequences = []
-    return_targets = []
-    direction_targets = []
 
-    # Also keep the raw current-day Close price for each
-    # sequence, so we can reconstruct a price-level plot later
-    # (purely for visualization — the model itself never sees
-    # or predicts raw price).
-    current_close_prices = []
+# ============================================================
+# CLEAN DATA
+# ============================================================
 
-    for ticker, group in df.groupby("Ticker"):
+required_columns = features + [
+    "Date",
+    "Ticker",
+    "Close",
+    "next_date",
+    "next_close",
+    "next_return",
+    regression_target,
+    direction_target,
+]
 
-        group = group.sort_values("Date").reset_index(drop=True)
+df = df.replace(
+    [np.inf, -np.inf],
+    np.nan
+)
 
-        X = group[features].values
+df = df.dropna(
+    subset=required_columns
+).copy()
 
-        returns = group["next_return"].values
-        directions = group["target"].values
-        target_dates = group["next_date"].values
-        closes = group["Close"].values
+df["Date"] = pd.to_datetime(df["Date"])
 
-        for i in range(sequence_length, len(group)):
+df = df.sort_values(
+    ["Ticker", "Date"]
+).reset_index(drop=True)
 
-            target_date = target_dates[i]
 
-            if pd.isna(target_date):
-                continue
+# ============================================================
+# SELECT TICKER
+# ============================================================
 
-            if min_target_date is not None:
-                if target_date < np.datetime64(min_target_date):
-                    continue
+ticker_df = df[
+    df["Ticker"] == PLOT_TICKER
+].copy()
 
-            if max_target_date is not None:
-                if target_date >= np.datetime64(max_target_date):
-                    continue
+ticker_df = ticker_df.sort_values(
+    "Date"
+).reset_index(drop=True)
 
-            X_sequences.append(
-                X[i - sequence_length:i]
-            )
+print("\nTicker:", PLOT_TICKER)
 
-            return_targets.append(
-                returns[i]
-            )
-
-            direction_targets.append(
-                directions[i]
-            )
-
-            current_close_prices.append(
-                closes[i]
-            )
-
-    return (
-        np.array(X_sequences),
-        np.array(return_targets),
-        np.array(direction_targets),
-        np.array(current_close_prices)
+if len(ticker_df) == 0:
+    raise ValueError(
+        f"No data found for ticker {PLOT_TICKER}"
     )
 
 
 # ============================================================
-# Naive Baseline (predict 0 return / majority class)
+# INPUT DATE
 # ============================================================
 
-def naive_baseline(return_targets, direction_targets):
+input_date = pd.Timestamp(INPUT_DATE)
 
-    naive_rmse = np.sqrt(
-        np.mean(return_targets ** 2)
+
+# ============================================================
+# GET HISTORY UP TO INPUT DATE
+# ============================================================
+
+history = ticker_df[
+    ticker_df["Date"] <= input_date
+].copy()
+
+history = history.sort_values("Date").reset_index(drop=True)
+
+
+if len(history) == 0:
+    raise ValueError(
+        f"No data available on or before {INPUT_DATE}"
     )
 
-    positive_rate = direction_targets.mean()
-    majority_accuracy = max(
-        positive_rate,
-        1 - positive_rate
-    ) * 100
 
-    return naive_rmse, majority_accuracy
+actual_input_date = history["Date"].iloc[-1]
+
+
+if actual_input_date != input_date:
+
+    raise ValueError(
+        f"{INPUT_DATE} is not available in dataset. "
+        f"Last available date is "
+        f"{actual_input_date.date()}"
+    )
 
 
 # ============================================================
-# Evaluation Function
-# Same metrics used during training
+# APPLY SAVED SCALER
+#
+# IMPORTANT:
+# We don't modify original prices.
+# We create scaled feature columns separately.
 # ============================================================
 
-def evaluate_model(
-    model,
-    data_loader,
-    plot=False,
-    n_points=200
-):
-    model.eval()
+print("\nPreparing model features...")
 
-    total_squared_error = 0.0
+history_scaled = history.copy()
 
-    total_correct = 0
-    total_samples = 0
+history_scaled.loc[:, features] = (
+    feature_scaler.transform(
+        history_scaled[features]
+    )
+)
 
-    # Store predictions for the graph (in return space)
-    actual_returns = []
-    predicted_returns = []
 
-    actual_directions = []
-    predicted_directions = []
+# ============================================================
+# CHECK HISTORY
+# ============================================================
 
-    current_closes_all = []
+sequence_data = history_scaled.tail(
+    sequence_length
+).copy()
+
+if len(sequence_data) < sequence_length:
+
+    raise ValueError(
+        f"Not enough history for {PLOT_TICKER}. "
+        f"Required {sequence_length}, "
+        f"found {len(sequence_data)}."
+    )
+
+
+print("\n==============================================")
+print("MODEL INPUT")
+print("==============================================")
+
+print(
+    "Input starts:",
+    sequence_data["Date"].iloc[0].date()
+)
+
+print(
+    "Input ends  :",
+    sequence_data["Date"].iloc[-1].date()
+)
+
+print(
+    "Number of input days:",
+    len(sequence_data)
+)
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+print("\nLoading trained LSTM model...")
+
+model = LSTMModel(
+    input_size=len(features),
+    hidden_size=HIDDEN_SIZE,
+    num_layers=NUM_LAYERS,
+    dropout=DROPOUT,
+).to(device)
+
+model.load_state_dict(
+    torch.load(
+        MODEL_PATH,
+        map_location=device,
+        weights_only=True
+    )
+)
+
+model.eval()
+
+print("Model loaded successfully.")
+
+
+# ============================================================
+# GET ACTUAL FUTURE DATA
+#
+# ONLY used for comparison AFTER predictions.
+# It is NEVER used as model input.
+# ============================================================
+
+future_actual = ticker_df[
+    ticker_df["Date"] > input_date
+].copy()
+
+future_actual = future_actual.sort_values(
+    "Date"
+).reset_index(drop=True)
+
+
+# ============================================================
+# HELPER:
+# FIND NEXT TRADING DATE
+# ============================================================
+
+future_actual_dates = future_actual["Date"]
+
+
+# ============================================================
+# RECURSIVE PREDICTION
+# ============================================================
+
+print("\n==============================================")
+print("STARTING 5-DAY RECURSIVE FORECAST")
+print("==============================================")
+
+
+# ------------------------------------------------------------
+# We maintain our own predicted history.
+#
+# IMPORTANT:
+# The actual historical data ends at INPUT_DATE.
+# After that, predicted prices are used recursively.
+# ------------------------------------------------------------
+
+working_history = history.copy()
+
+
+predictions = []
+
+
+for step in range(FORECAST_DAYS):
+
+    print("\n")
+    print("-" * 70)
+    print(f"FORECAST STEP {step + 1}")
+    print("-" * 70)
+
+
+    # ========================================================
+    # GET LAST SEQUENCE_LENGTH ROWS
+    # ========================================================
+
+    recent = working_history.tail(
+        sequence_length
+    ).copy()
+
+
+    if len(recent) < sequence_length:
+
+        raise ValueError(
+            "Not enough data for recursive prediction."
+        )
+
+
+    # ========================================================
+    # SCALE FEATURES USING TRAINED SCALER
+    # ========================================================
+
+    recent_scaled = recent.copy()
+
+    recent_scaled.loc[:, features] = (
+        feature_scaler.transform(
+            recent_scaled[features]
+        )
+    )
+
+
+    # ========================================================
+    # CREATE LSTM INPUT
+    # ========================================================
+
+    X = recent_scaled[
+        features
+    ].values.astype(np.float32)
+
+
+    X = torch.tensor(
+        X,
+        dtype=torch.float32
+    )
+
+
+    X = X.unsqueeze(0)
+
+    X = X.to(device)
+
+
+    # ========================================================
+    # MODEL PREDICTION
+    # ========================================================
 
     with torch.no_grad():
 
-        for (
-            X_batch,
-            return_batch,
-            direction_batch,
-            close_batch
-        ) in data_loader:
+        price_output, direction_output = model(X)
 
-            # ---------------------------------------------
-            # Move data to CPU/GPU
-            # ---------------------------------------------
 
-            X_batch = X_batch.to(device)
-            return_batch = return_batch.to(device)
-            direction_batch = direction_batch.to(device)
+    # ========================================================
+    # EXTRACT MODEL OUTPUT
+    # ========================================================
 
-            # ---------------------------------------------
-            # Model prediction
-            # ---------------------------------------------
-
-            return_pred, direction_pred = model(X_batch)
-
-            return_pred = return_pred.squeeze(1)
-            direction_pred = direction_pred.squeeze(1)
-
-            # ---------------------------------------------
-            # Return error
-            # ---------------------------------------------
-
-            squared_error = (
-                return_pred - return_batch
-            ) ** 2
-
-            total_squared_error += (
-                squared_error.sum().item()
-            )
-
-            # ---------------------------------------------
-            # Store return predictions
-            # ---------------------------------------------
-
-            actual_returns.extend(
-                return_batch.cpu().numpy()
-            )
-
-            predicted_returns.extend(
-                return_pred.cpu().numpy()
-            )
-
-            current_closes_all.extend(
-                close_batch.numpy()
-            )
-
-            # ---------------------------------------------
-            # Direction prediction
-            # ---------------------------------------------
-
-            direction_probability = torch.sigmoid(
-                direction_pred
-            )
-
-            direction_prediction = (
-                direction_probability >= 0.5
-            ).float()
-
-            total_correct += (
-                direction_prediction == direction_batch
-            ).sum().item()
-
-            total_samples += (
-                direction_batch.size(0)
-            )
-
-            actual_directions.extend(
-                direction_batch.cpu().numpy()
-            )
-
-            predicted_directions.extend(
-                direction_prediction.cpu().numpy()
-            )
-
-    # -----------------------------------------------------
-    # Convert lists to NumPy arrays
-    # -----------------------------------------------------
-
-    actual_returns = np.array(actual_returns)
-    predicted_returns = np.array(predicted_returns)
-    actual_directions = np.array(actual_directions)
-    predicted_directions = np.array(predicted_directions)
-    current_closes_all = np.array(current_closes_all)
-
-    # -----------------------------------------------------
-    # Calculate RMSE (in return space)
-    # -----------------------------------------------------
-
-    rmse = np.sqrt(
-        total_squared_error / total_samples
-    )
-
-    # -----------------------------------------------------
-    # Calculate directional accuracy
-    # -----------------------------------------------------
-
-    directional_accuracy = (
-        total_correct / total_samples
-    ) * 100
-
-    # -----------------------------------------------------
-    # Naive baseline, for context
-    # -----------------------------------------------------
-
-    naive_rmse, naive_acc = naive_baseline(
-        actual_returns, actual_directions
-    )
-
-    # -----------------------------------------------------
-    # Print results
-    # -----------------------------------------------------
-
-    print(f"Test Return RMSE: {rmse:.5f}")
-    print(f"Test Directional Accuracy: {directional_accuracy:.2f}%")
-    print(
-        f"Naive baseline -> RMSE: {naive_rmse:.5f}  "
-        f"Majority-class Acc: {naive_acc:.2f}%"
-    )
-
-    # -----------------------------------------------------
-    # Plot Actual vs Predicted
-    #
-    # Reconstructed into price space purely for a readable
-    # chart: price_next = current_close * (1 + predicted_return)
-    # This is NOT what the model was trained/evaluated on —
-    # the real metrics above are computed in return space.
-    # -----------------------------------------------------
-
-    if plot:
-
-        n_points = min(n_points, len(actual_returns))
-
-        actual_price_reconstructed = (
-            current_closes_all[:n_points] *
-            (1 + actual_returns[:n_points])
-        )
-
-        predicted_price_reconstructed = (
-            current_closes_all[:n_points] *
-            (1 + predicted_returns[:n_points])
-        )
-
-        fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-
-        # Return-space plot (the metric that actually matters)
-        axes[0].plot(
-            actual_returns[:n_points],
-            label="Actual Return"
-        )
-        axes[0].plot(
-            predicted_returns[:n_points],
-            label="Predicted Return"
-        )
-        axes[0].axhline(0, color="gray", linewidth=0.8)
-        axes[0].set_xlabel("Test Sample")
-        axes[0].set_ylabel("Next-Day Return")
-        axes[0].set_title("Actual vs Predicted Return (model's real target)")
-        axes[0].legend()
-        axes[0].grid(True)
-
-        # Reconstructed price-space plot (for intuition only)
-        axes[1].plot(
-            actual_price_reconstructed,
-            label="Actual Price"
-        )
-        axes[1].plot(
-            predicted_price_reconstructed,
-            label="Predicted Price"
-        )
-        axes[1].set_xlabel("Test Sample")
-        axes[1].set_ylabel("Stock Price")
-        axes[1].set_title(
-            "Reconstructed Price (for reference only — not the training target)"
-        )
-        axes[1].legend()
-        axes[1].grid(True)
-
-        plt.tight_layout()
-        plt.show()
-
-    # -----------------------------------------------------
-    # Return everything
-    # -----------------------------------------------------
-
-    return (
-        rmse,
-        directional_accuracy,
-        naive_rmse,
-        naive_acc,
-        actual_returns,
-        predicted_returns,
-        actual_directions,
-        predicted_directions
+    pred_log_return = float(
+        price_output
+        .cpu()
+        .numpy()
+        .flatten()[0]
     )
 
 
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-
-    # ========================================================
-    # 1. Load data
-    # ========================================================
-
-    print("\nLoading data...")
-
-    df = get_data()
-
-    df["Date"] = pd.to_datetime(df["Date"])
-
-    df = df.sort_values(
-        ["Ticker", "Date"]
-    ).reset_index(drop=True)
-
-    # ========================================================
-    # 2. Create next_date
-    # ========================================================
-
-    df["next_date"] = (
-        df.groupby("Ticker")["Date"]
-        .shift(-1)
+    direction_probability = float(
+        torch.sigmoid(direction_output)
+        .cpu()
+        .numpy()
+        .flatten()[0]
     )
 
+
     # ========================================================
-    # 3. Features
-    # EXACTLY same as train_model.py (relative MA features,
-    # not raw MA5 / MA20)
+    # CURRENT PRICE
     # ========================================================
 
-    features = [
-        "return_1d",
-        "return_5d",
-        "price_to_MA5",
-        "price_to_MA20",
-        "MA5_to_MA20",
-        "volatility_5d",
-        "volume_change",
-        "month_sin",
-        "month_cos"
+    current_close = float(
+        working_history["Close"].iloc[-1]
+    )
+
+
+    # ========================================================
+    # PREDICT NEXT PRICE
+    # ========================================================
+
+    predicted_close = (
+        current_close
+        * np.exp(pred_log_return)
+    )
+
+
+    # ========================================================
+    # PREDICT DIRECTION
+    # ========================================================
+
+    predicted_direction = (
+        "UP"
+        if direction_probability >= 0.5
+        else "DOWN"
+    )
+
+
+    # ========================================================
+    # DETERMINE NEXT TRADING DATE
+    # ========================================================
+
+    last_date = working_history[
+        "Date"
+    ].iloc[-1]
+
+
+    future_dates = future_actual_dates[
+        future_actual_dates > last_date
     ]
 
+
+    if len(future_dates) > 0:
+
+        next_date = future_dates[0]
+
+    else:
+
+        # If actual future data is unavailable,
+        # use business-day calculation.
+
+        next_date = (
+            last_date
+            + pd.offsets.BDay(1)
+        )
+
+
     # ========================================================
-    # 4. Split dates
-    # EXACTLY same as train_model.py
+    # ACTUAL PRICE
+    #
+    # Used ONLY for evaluation.
     # ========================================================
 
-    validation_start = pd.Timestamp("2012-01-01")
-    test_start = pd.Timestamp("2015-01-01")
+    actual_match = future_actual[
+        future_actual["Date"] == next_date
+    ]
+
+
+    if len(actual_match) > 0:
+
+        actual_close = float(
+            actual_match["Close"].iloc[0]
+        )
+
+    else:
+
+        actual_close = np.nan
+
 
     # ========================================================
-    # 5. Recreate the scaler
+    # ACTUAL DIRECTION
+    # ========================================================
+
+    if not np.isnan(actual_close):
+
+        actual_return = (
+            actual_close - current_close
+        ) / current_close
+
+        actual_direction = (
+            "UP"
+            if actual_return > 0
+            else "DOWN"
+        )
+
+        direction_correct = (
+            predicted_direction
+            == actual_direction
+        )
+
+    else:
+
+        actual_return = np.nan
+        actual_direction = "N/A"
+        direction_correct = False
+
+
+    # ========================================================
+    # STORE RESULT
+    # ========================================================
+
+    predictions.append({
+
+        "Date": next_date,
+
+        "Current Close": current_close,
+
+        "Predicted Close": predicted_close,
+
+        "Actual Close": actual_close,
+
+        "Predicted Log Return": pred_log_return,
+
+        "Direction Probability": direction_probability,
+
+        "Predicted Direction": predicted_direction,
+
+        "Actual Direction": actual_direction,
+
+        "Direction Correct": direction_correct,
+
+    })
+
+
+    # ========================================================
+    # PRINT RESULT
+    # ========================================================
+
+    print(
+        f"Prediction date      : {next_date.date()}"
+    )
+
+    print(
+        f"Previous close       : {current_close:.4f}"
+    )
+
+    print(
+        f"Predicted close      : {predicted_close:.4f}"
+    )
+
+    print(
+        f"Predicted log return : {pred_log_return:.6f}"
+    )
+
+    print(
+        f"Predicted direction  : {predicted_direction}"
+    )
+
+    print(
+        f"Direction probability: "
+        f"{direction_probability:.4f}"
+    )
+
+
+    if not np.isnan(actual_close):
+
+        error_percent = (
+            (predicted_close - actual_close)
+            / actual_close
+            * 100
+        )
+
+        print(
+            f"Actual close         : {actual_close:.4f}"
+        )
+
+        print(
+            f"Actual direction     : "
+            f"{actual_direction}"
+        )
+
+        print(
+            f"Direction correct    : "
+            f"{'YES' if direction_correct else 'NO'}"
+        )
+
+        print(
+            f"Price error          : "
+            f"{error_percent:.4f}%"
+        )
+
+
+    # ========================================================
+    # ADD PREDICTED ROW TO WORKING HISTORY
     #
     # IMPORTANT:
-    # Your original training code fitted the scaler ONLY
-    # using data before 2012-01-01. We reproduce that here
-    # because scaler.pkl was not saved.
+    # We need to create the next row so that it can be
+    # used for the following prediction.
     # ========================================================
 
-    print("\nRecreating StandardScaler...")
+    new_row = working_history.iloc[-1].copy()
 
-    train_rows = df[
-        df["Date"] < validation_start
-    ].copy()
 
-    scaler = StandardScaler()
+    new_row["Date"] = next_date
 
-    scaler.fit(train_rows[features])
+    new_row["Close"] = predicted_close
 
-    print("Scaler recreated successfully.")
 
-    # ========================================================
-    # 6. Apply scaler to entire dataset
-    # ========================================================
-
-    df[features] = scaler.transform(df[features])
-
-    # ========================================================
-    # 7. Create test context
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Recalculate quantitative features.
     #
-    # Same logic as train_model.py: last 20 observations
-    # before 2015 for every ticker.
-    # ========================================================
+    # We create a temporary raw-price dataframe and run
+    # add_quant_features again.
+    # --------------------------------------------------------
 
-    print("\nCreating test context...")
-
-    test_context = (
-        df[df["Date"] < test_start]
-        .groupby("Ticker")
-        .tail(20)
+    temp_history = pd.concat(
+        [
+            working_history,
+            pd.DataFrame([new_row])
+        ],
+        ignore_index=True
     )
 
-    # ========================================================
-    # 8. Get test data
-    # ========================================================
 
-    test_data = df[df["Date"] >= test_start]
+    # --------------------------------------------------------
+    # Recalculate features from predicted price history
+    # --------------------------------------------------------
 
-    # ========================================================
-    # 9. Combine context + test data
-    # ========================================================
-
-    test_sequence_df = pd.concat(
-        [test_context, test_data]
+    temp_history = temp_history.drop(
+        columns=[
+            c for c in [
+                "next_date",
+                "next_close",
+                "next_return",
+                "next_log_return",
+                "direction_target"
+            ]
+            if c in temp_history.columns
+        ],
+        errors="ignore"
     )
 
-    # ========================================================
-    # 10. Sort test data
-    # ========================================================
 
-    test_sequence_df = (
-        test_sequence_df
-        .sort_values(["Ticker", "Date"])
-        .reset_index(drop=True)
+    temp_history = add_quant_features(
+        temp_history
     )
 
-    # ========================================================
-    # 11. Create test sequences
-    # ========================================================
 
-    print("\nCreating test sequences...")
+    # --------------------------------------------------------
+    # Keep only the columns needed for next iteration
+    # --------------------------------------------------------
 
-    X_test, return_test, direction_test, close_test = (
-        create_sequences_with_date_filter(
-            test_sequence_df,
-            features,
-            sequence_length=20,
-            min_target_date=test_start,
-            max_target_date=None
-        )
+    working_history = temp_history.copy()
+
+
+# ============================================================
+# RESULTS DATAFRAME
+# ============================================================
+
+results = pd.DataFrame(
+    predictions
+)
+
+
+# ============================================================
+# PRINT FINAL TABLE
+# ============================================================
+
+print("\n")
+print("=" * 100)
+print("5-DAY FORECAST RESULTS")
+print("=" * 100)
+
+display_columns = [
+    "Date",
+    "Current Close",
+    "Predicted Close",
+    "Actual Close",
+    "Predicted Direction",
+    "Actual Direction",
+    "Direction Probability",
+    "Direction Correct",
+]
+
+print(
+    results[
+        display_columns
+    ].to_string(index=False)
+)
+
+
+# ============================================================
+# GRAPH
+# ============================================================
+
+print("\n==============================================")
+print("CREATING GRAPH")
+print("==============================================")
+
+
+# ------------------------------------------------------------
+# Historical starting point
+# ------------------------------------------------------------
+
+plot_dates = [
+    input_date
+] + results["Date"].tolist()
+
+
+# ------------------------------------------------------------
+# Actual prices
+#
+# Starting price is known.
+# Future actual prices are only for comparison.
+# ------------------------------------------------------------
+
+actual_prices = [
+    float(
+        history["Close"].iloc[-1]
     )
+]
 
-    # ========================================================
-    # 12. Print shapes
-    # ========================================================
 
-    print("\n===== TEST DATA SHAPES =====")
-    print("X_test:", X_test.shape)
-    print("Return test:", return_test.shape)
-    print("Direction test:", direction_test.shape)
+for value in results["Actual Close"]:
 
-    # ========================================================
-    # 13. Convert to PyTorch tensors
-    # ========================================================
+    actual_prices.append(value)
 
-    X_test = torch.tensor(X_test, dtype=torch.float32)
-    return_test = torch.tensor(return_test, dtype=torch.float32)
-    direction_test = torch.tensor(direction_test, dtype=torch.float32)
-    close_test = torch.tensor(close_test, dtype=torch.float32)
 
-    # ========================================================
-    # 14. Create test dataset
-    # ========================================================
+# ------------------------------------------------------------
+# Predicted prices
+#
+# Starting point = actual Feb 18 price
+# Then model predictions.
+# ------------------------------------------------------------
 
-    test_dataset = TensorDataset(
-        X_test,
-        return_test,
-        direction_test,
-        close_test
+predicted_prices = [
+    float(
+        history["Close"].iloc[-1]
     )
+] + results[
+    "Predicted Close"
+].tolist()
 
-    # ========================================================
-    # 15. Create DataLoader
-    # Same batch size as training
-    # ========================================================
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=64,
-        shuffle=False
-    )
+plt.figure(
+    figsize=(14, 8)
+)
 
-    # ========================================================
-    # 16. Create model architecture
-    # MUST exactly match training
-    # ========================================================
 
-    print("\nCreating LSTM model...")
+# ============================================================
+# ACTUAL
+# ============================================================
 
-    model = LSTMModel(
-        input_size=len(features),
-        hidden_size=64,
-        num_layers=2,
-        dropout=0.2
-    )
+plt.plot(
+    plot_dates,
+    actual_prices,
+    marker="o",
+    linewidth=2,
+    label="Actual Price"
+)
 
-    # ========================================================
-    # 17. Load saved model
-    # ========================================================
 
-    model_path = "best_lstm_stock_model.pth"
+# ============================================================
+# PREDICTED
+# ============================================================
 
-    print("\nLoading trained model...")
+plt.plot(
+    plot_dates,
+    predicted_prices,
+    marker="o",
+    linestyle="--",
+    linewidth=2,
+    label="Recursive Prediction"
+)
 
-    model.load_state_dict(
-        torch.load(
-            model_path,
-            map_location=device,
-            weights_only=True
-        )
-    )
 
-    model.to(device)
-    model.eval()
+# ============================================================
+# MARK STARTING POINT
+# ============================================================
 
-    print("Model loaded successfully!")
+plt.scatter(
+    input_date,
+    history["Close"].iloc[-1],
+    s=120,
+    zorder=5
+)
 
-    # ========================================================
-    # 18. Evaluate
-    # ========================================================
 
-    print("\nEvaluating test data...")
-
+plt.annotate(
+    f"Last Actual: "
+    f"{history['Close'].iloc[-1]:.2f}",
     (
-        rmse,
-        accuracy,
-        naive_rmse,
-        naive_acc,
-        actual_returns,
-        predicted_returns,
-        actual_directions,
-        predicted_directions
-    ) = evaluate_model(
-        model,
-        test_loader,
-        plot=True,
-        n_points=200
-    )
-
-    # ========================================================
-    # 19. Final results
-    # ========================================================
-
-    print("\n==========================================")
-    print("           FINAL TEST RESULTS")
-    print("==========================================")
-    print(f"Test Return RMSE: {rmse:.5f}")
-    print(f"Test Directional Accuracy: {accuracy:.2f}%")
-    print(
-        f"Naive Baseline RMSE: {naive_rmse:.5f}  "
-        f"Naive Majority-Class Accuracy: {naive_acc:.2f}%"
-    )
-    print("==========================================")
+        input_date,
+        history["Close"].iloc[-1]
+    ),
+    xytext=(-20, 15),
+    textcoords="offset points",
+    fontsize=10
+)
 
 
 # ============================================================
-# Run
+# LABEL PREDICTIONS
 # ============================================================
 
-if __name__ == "__main__":
+for _, row in results.iterrows():
 
-    main()
+    plt.annotate(
+        f"{row['Predicted Close']:.2f}",
+        (
+            row["Date"],
+            row["Predicted Close"]
+        ),
+        xytext=(5, 10),
+        textcoords="offset points",
+        fontsize=9
+    )
+
+
+# ============================================================
+# LABELS
+# ============================================================
+
+plt.xlabel(
+    "Date"
+)
+
+plt.ylabel(
+    f"{PLOT_TICKER} Price"
+)
+
+plt.title(
+    f"{PLOT_TICKER}: 5-Day Recursive Next-Trading-Day Forecast\n"
+    f"Last Actual Data: {input_date.date()}"
+)
+
+plt.legend()
+
+plt.grid(
+    True,
+    alpha=0.3
+)
+
+plt.xticks(
+    rotation=30
+)
+
+plt.tight_layout()
+
+
+# ============================================================
+# SAVE GRAPH
+# ============================================================
+
+graph_path = "5_day_recursive_prediction.png"
+
+plt.savefig(
+    graph_path,
+    dpi=150,
+    bbox_inches="tight"
+)
+
+print(
+    f"\nGraph saved as: {graph_path}"
+)
+
+
+# ============================================================
+# SHOW GRAPH
+# ============================================================
+
+plt.show()
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("DONE")
+print("=" * 70)
+
+print(
+    f"Ticker              : {PLOT_TICKER}"
+)
+
+print(
+    f"Last actual date    : "
+    f"{input_date.date()}"
+)
+
+print(
+    f"Forecast days       : "
+    f"{FORECAST_DAYS}"
+)
+
+print(
+    "\nThe model performed recursive "
+    "one-day-ahead predictions."
+)
+
+print(
+    "Future predictions were generated "
+    "without using future actual prices."
+)
