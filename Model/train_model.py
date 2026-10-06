@@ -1,209 +1,55 @@
-import random
 import pickle
+import random
+
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from torch.utils.data import DataLoader, TensorDataset
 
 from Data_Processing.target_data import get_data
 from Model.model import LSTMModel
 
-
-# ============================================================
-# Reproducibility
-# ============================================================
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 
-# ============================================================
-# Configuration
-# ============================================================
-HORIZON = 1                    # next trading day
-SEQUENCE_LENGTH = 20
+HORIZON = 1
+SEQUENCE_LENGTH = 60
 
-VALIDATION_START = pd.Timestamp("2012-01-01")
-TEST_START = pd.Timestamp("2015-01-01")
+TRAIN_START = pd.Timestamp("2010-01-01")
+VALIDATION_START = pd.Timestamp("2016-01-01")
+TEST_START = pd.Timestamp("2018-01-01")
+TEST_END = pd.Timestamp("2020-01-01")
 
-BETA_WINDOWS = (20, 60)
-VOL_WINDOW = 20
 
-BATCH_SIZE = 256
-HIDDEN_SIZE = 64
+BATCH_SIZE = 512
+HIDDEN_SIZE = 128
 NUM_LAYERS = 2
-DROPOUT = 0.20
-LEARNING_RATE = 3e-4
+DROPOUT = 0.40
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 EPOCHS = 50
-PATIENCE = 7
+PATIENCE = 12
 
-# Project targets:
-# 1) regression: next-day log return
-# 2) classification: next-day raw UP/DOWN
 REGRESSION_TARGET = "next_log_return"
 DIRECTION_TARGET = "direction_target"
 
-ALPHA = 1.0
+ALPHA = 0.1
 BETA = 1.0
 
-MODEL_PATH = "best_lstm_stock_model_v5.pth"
-SCALER_PATH = "lstm_stock_scalers_v5.pkl"
+FEATURE_CLIP = 5.0
+
+TARGET_WINSOR_Q = (0.005, 0.995)
+
+MODEL_PATH = f"best_lstm_stock_model_v1_h{HORIZON}.pth"
+SCALER_PATH = f"lstm_stock_scalers_v1_h{HORIZON}.pkl"
 
 
-# ============================================================
-# Quant feature engineering
-# ============================================================
-def add_quant_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create stationary/relative market features using data known at t.
-
-    get_data() already builds several market features
-    (market_return_1d, market_return_5d, market_volatility,
-    market_breadth). Those are KEPT as-is. This function only adds
-    columns that get_data() does not already provide, so nothing is
-    silently duplicated or renamed by the merge.
-    """
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    if "return_1d" not in df.columns:
-        df["return_1d"] = df.groupby("Ticker")["Close"].pct_change()
-
-    if "return_5d" not in df.columns:
-        df["return_5d"] = df.groupby("Ticker")["Close"].pct_change(5)
-
-    if "volatility_5d" not in df.columns:
-        df["volatility_5d"] = (
-            df.groupby("Ticker")["return_1d"]
-            .transform(lambda x: x.rolling(5).std())
-        )
-
-    if "volatility_20d" not in df.columns:
-        df["volatility_20d"] = (
-            df.groupby("Ticker")["return_1d"]
-            .transform(lambda x: x.rolling(VOL_WINDOW).std())
-        )
-
-    # --------------------------------------------------------
-    # Equal-weighted market proxy (date-level features).
-    # Only merge columns that are not already in the dataframe.
-    # --------------------------------------------------------
-    market_r = df.groupby("Date")["return_1d"].mean().sort_index()
-
-    market_df = pd.DataFrame({"market_return_1d": market_r})
-
-    market_df["market_return_5d"] = (
-        (1.0 + market_r).rolling(5).apply(np.prod, raw=True) - 1.0
-    )
-
-    market_df["market_trend_20d"] = (
-        (1.0 + market_r).rolling(20).apply(np.prod, raw=True) - 1.0
-    )
-
-    market_df = market_df.reset_index()
-
-    new_cols = [
-        c for c in market_df.columns
-        if c == "Date" or c not in df.columns
-    ]
-    df = df.merge(market_df[new_cols], on="Date", how="left")
-
-    if "excess_return_1d" not in df.columns:
-        df["excess_return_1d"] = df["return_1d"] - df["market_return_1d"]
-
-    # --------------------------------------------------------
-    # Rolling beta + cumulative residual return.
-    # (Overwrites the get_data() beta with the same definition and
-    # adds the cumulative residual columns used as features.)
-    # --------------------------------------------------------
-    for window in BETA_WINDOWS:
-        beta_col = f"rolling_beta_{window}"
-        residual_col = f"residual_return_{window}d"
-
-        df[beta_col] = np.nan
-        df[residual_col] = np.nan
-
-        for ticker, idx in df.groupby("Ticker", sort=False).groups.items():
-            idx = np.asarray(idx)
-
-            stock_r = df.loc[idx, "return_1d"]
-            mkt_r = df.loc[idx, "market_return_1d"]
-
-            cov = stock_r.rolling(window).cov(mkt_r)
-            var = mkt_r.rolling(window).var()
-
-            beta = cov / var.replace(0.0, np.nan)
-            residual = stock_r - beta * mkt_r
-
-            cumulative_residual = (
-                (1.0 + residual)
-                .rolling(window)
-                .apply(np.prod, raw=True)
-                - 1.0
-            )
-
-            df.loc[idx, beta_col] = beta.to_numpy()
-            df.loc[idx, residual_col] = cumulative_residual.to_numpy()
-
-    # --------------------------------------------------------
-    # Relative volume
-    # --------------------------------------------------------
-    volume_col = None
-    if "Volume" in df.columns:
-        volume_col = "Volume"
-    elif "volume" in df.columns:
-        volume_col = "volume"
-
-    if "volume_change" not in df.columns:
-        if volume_col is not None:
-            df["volume_change"] = (
-                df.groupby("Ticker")[volume_col].pct_change()
-            )
-        else:
-            df["volume_change"] = 0.0
-
-    if volume_col is not None:
-        avg_volume = (
-            df.groupby("Ticker")[volume_col]
-            .transform(lambda x: x.rolling(20).mean())
-        )
-        df["relative_volume_20d"] = df[volume_col] / avg_volume - 1.0
-    else:
-        df["relative_volume_20d"] = df["volume_change"]
-
-    return df
-
-
-# ============================================================
-# Targets
-# ============================================================
-def add_targets(df: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
-    """
-    Regression target: next_log_return = log(Close[t+h] / Close[t])
-    Direction target : 1 if Close[t+h] > Close[t], else 0
-    """
-    df = df.copy()
-
-    df["next_close"] = df.groupby("Ticker")["Close"].shift(-horizon)
-    df["next_date"] = df.groupby("Ticker")["Date"].shift(-horizon)
-
-    df["next_return"] = (df["next_close"] - df["Close"]) / df["Close"]
-    df["next_log_return"] = np.log(df["next_close"] / df["Close"])
-
-    df["direction_target"] = (df["next_return"] > 0).astype(np.float32)
-
-    return df
-
-
-# ============================================================
-# Sequence creation
-# ============================================================
 def create_sequences(
-    df: pd.DataFrame,
+    df,
     features,
     sequence_length=20,
     target_name=REGRESSION_TARGET,
@@ -211,12 +57,6 @@ def create_sequences(
     min_target_date=None,
     max_target_date=None,
 ):
-    """
-    For row i (day t), the input window is the sequence_length days
-    ENDING AT day i (rows i-L+1 ... i), and the targets are the move
-    from close[i] to close[i+h]. The most recent day is therefore
-    inside the input window.
-    """
     X_sequences = []
     regression_targets = []
     direction_targets = []
@@ -245,21 +85,20 @@ def create_sequences(
             if pd.isna(target_date):
                 continue
 
-            if min_target_date is not None:
-                if target_date < np.datetime64(min_target_date):
-                    continue
+            if min_target_date is not None and target_date < np.datetime64(min_target_date):
+                continue
 
-            if max_target_date is not None:
-                if target_date >= np.datetime64(max_target_date):
-                    continue
+            if max_target_date is not None and target_date >= np.datetime64(max_target_date):
+                continue
 
-            values = X[i - sequence_length + 1: i + 1]
+            values = X[i - sequence_length + 1:i + 1]
             reg = regression[i]
             direc = direction[i]
 
             if not np.isfinite(values).all():
                 continue
-            if not np.isfinite(reg) or not np.isfinite(next_return[i]):
+
+            if not np.isfinite(reg) or not np.isfinite(direc):
                 continue
             if not np.isfinite(current_close[i]) or not np.isfinite(next_close[i]):
                 continue
@@ -285,97 +124,12 @@ def create_sequences(
     }
 
 
-# ============================================================
-# Metrics
-# ============================================================
-def safe_ic(pred, actual):
-    pred = np.asarray(pred, dtype=np.float64)
-    actual = np.asarray(actual, dtype=np.float64)
-
-    valid = np.isfinite(pred) & np.isfinite(actual)
-    pred = pred[valid]
-    actual = actual[valid]
-
-    if len(pred) < 2 or np.std(pred) == 0 or np.std(actual) == 0:
-        return np.nan
-
-    return float(np.corrcoef(pred, actual)[0, 1])
-
-
-def safe_spearman_ic(pred, actual):
-    pred = np.asarray(pred, dtype=np.float64)
-    actual = np.asarray(actual, dtype=np.float64)
-
-    valid = np.isfinite(pred) & np.isfinite(actual)
-    pred = pred[valid]
-    actual = actual[valid]
-
-    if len(pred) < 2:
-        return np.nan
-
-    pred_rank = pd.Series(pred).rank(method="average").to_numpy()
-    actual_rank = pd.Series(actual).rank(method="average").to_numpy()
-    return safe_ic(pred_rank, actual_rank)
-
-
-def per_date_rank_ic(split, metrics, min_stocks=20):
-    """Cross-sectional rank IC, computed separately for each date and
-    then averaged.
-
-    A pooled IC mixes two things: market-timing (all stocks rise
-    together on a strong day) and stock-selection (which stocks rise
-    more than others on that day). Computing IC within each date
-    removes the market-level component, so this number measures
-    stock-selection skill only.
-
-    Returns mean IC, IC std, ICIR (mean/std) and the fraction of
-    dates with positive IC.
-    """
-    frame = pd.DataFrame({
-        "Date": pd.to_datetime(split["target_dates"]),
-        "Pred": metrics["pred_log_return"],
-        "Actual": split["next_return"],
-    })
-
-    counts = frame.groupby("Date")["Pred"].transform("size")
-    frame = frame[counts >= min_stocks]
-
-    if frame.empty:
-        return {"mean_ic": np.nan, "ic_std": np.nan,
-                "icir": np.nan, "pct_positive": np.nan, "days": 0}
-
-    frame["p_rank"] = frame.groupby("Date")["Pred"].rank()
-    frame["a_rank"] = frame.groupby("Date")["Actual"].rank()
-
-    daily_ic = frame.groupby("Date").apply(
-        lambda g: g["p_rank"].corr(g["a_rank"])
-    ).dropna()
-
-    if len(daily_ic) < 2:
-        return {"mean_ic": np.nan, "ic_std": np.nan,
-                "icir": np.nan, "pct_positive": np.nan,
-                "days": len(daily_ic)}
-
-    mean_ic = float(daily_ic.mean())
-    ic_std = float(daily_ic.std(ddof=1))
-
-    return {
-        "mean_ic": mean_ic,
-        "ic_std": ic_std,
-        "icir": mean_ic / ic_std if ic_std > 0 else np.nan,
-        "pct_positive": float((daily_ic > 0).mean() * 100.0),
-        "days": int(len(daily_ic)),
-    }
-
-
 def naive_baselines(split):
     """Reference numbers every model result must be compared against."""
     p_up = float(split["direction"].mean())
 
     return {
-        # Always predict the more common class
         "majority_accuracy": max(p_up, 1.0 - p_up) * 100.0,
-        # Predict tomorrow's price == today's price
         "same_price_rmse": float(np.sqrt(np.mean(
             (split["current_close"] - split["next_close"]) ** 2
         ))),
@@ -427,15 +181,6 @@ def evaluate_model(model, data_loader, target_scaler, device):
 
     accuracy = float(np.mean(direction_prediction == direction_actual) * 100.0)
 
-    balanced_accuracy = float(
-        balanced_accuracy_score(direction_actual, direction_prediction) * 100.0
-    )
-
-    try:
-        auc = float(roc_auc_score(direction_actual, direction_probability))
-    except ValueError:
-        auc = np.nan
-
     return {
         "pred_scaled": pred_scaled,
         "actual_scaled": actual_scaled,
@@ -445,10 +190,6 @@ def evaluate_model(model, data_loader, target_scaler, device):
         "direction_prediction": direction_prediction,
         "direction_actual": direction_actual,
         "accuracy": accuracy,
-        "balanced_accuracy": balanced_accuracy,
-        "auc": auc,
-        "pearson_ic": safe_ic(pred_log_return, actual_log_return),
-        "spearman_ic": safe_spearman_ic(pred_log_return, actual_log_return),
         "rmse_log_return": float(
             np.sqrt(np.mean((pred_log_return - actual_log_return) ** 2))
         ),
@@ -473,143 +214,67 @@ def price_metrics(split, metrics):
     }
 
 
-# ============================================================
-# Optional simple long/short diagnostic
-# ============================================================
-def long_short_diagnostic(split, metrics, top_fraction=0.10):
-    """Rank stocks by predicted next-day log return.
-
-    Research diagnostic only. No costs/slippage/constraints.
-    """
-    frame = pd.DataFrame({
-        "Date": pd.to_datetime(split["target_dates"]),
-        "Ticker": split["tickers"],
-        "Pred": metrics["pred_log_return"],
-        "Actual": split["next_return"],
-    })
-
-    daily = []
-
-    for date, day in frame.groupby("Date"):
-        day = day.dropna(subset=["Pred", "Actual"])
-        if len(day) < 20:
-            continue
-
-        n = max(1, int(len(day) * top_fraction))
-        day = day.sort_values("Pred")
-
-        short_ret = day.head(n)["Actual"].mean()
-        long_ret = day.tail(n)["Actual"].mean()
-
-        daily.append(long_ret - short_ret)
-
-    if len(daily) < 2:
-        return None
-
-    daily = np.asarray(daily, dtype=np.float64)
-    std = daily.std(ddof=1)
-
-    sharpe = daily.mean() / std * np.sqrt(252.0) if std > 0 else np.nan
-
-    equity = np.cumprod(1.0 + daily)
-    running_max = np.maximum.accumulate(equity)
-    max_drawdown = np.min(equity / running_max - 1.0)
-
-    return {
-        "days": len(daily),
-        "mean_daily_spread": float(daily.mean()),
-        "sharpe": float(sharpe),
-        "max_drawdown": float(max_drawdown),
-    }
-
-
-# ============================================================
-# Result printing
-# ============================================================
 def print_results(title, split, metrics):
     price = price_metrics(split, metrics)
     naive = naive_baselines(split)
-    date_ic = per_date_rank_ic(split, metrics)
+
+    # Naive return RMSE = error of always predicting a return of zero.
+    naive_return_rmse = float(np.sqrt(np.mean(metrics["actual_log_return"] ** 2)))
 
     print(f"\n===== {title} =====")
-    print(f"Log-return RMSE:    {metrics['rmse_log_return']:.6f}")
+    print(f"Log-return RMSE:    {metrics['rmse_log_return']:.6f}"
+          f"   (zero-return baseline: {naive_return_rmse:.6f})")
     print(f"Log-return MAE:     {metrics['mae_log_return']:.6f}")
     print(f"Price RMSE:         {price['rmse']:.4f}"
           f"   (same-price baseline: {naive['same_price_rmse']:.4f})")
     print(f"Price MAE:          {price['mae']:.4f}"
           f"   (same-price baseline: {naive['same_price_mae']:.4f})")
-    print(f"UP/DOWN Accuracy:   {metrics['accuracy']:.2f}%"
+    print(f"Directional Acc.:   {metrics['accuracy']:.2f}%"
           f"   (always-majority baseline: {naive['majority_accuracy']:.2f}%)")
-    print(f"Balanced Accuracy:  {metrics['balanced_accuracy']:.2f}%   (random: 50.00%)")
-    print(f"Direction AUC:      {metrics['auc']:.4f}   (random: 0.5000)")
-    print(f"Pooled Pearson IC:  {metrics['pearson_ic']:.4f}")
-    print(f"Pooled Spearman IC: {metrics['spearman_ic']:.4f}")
-    print(f"Per-date Rank IC:   {date_ic['mean_ic']:.4f}"
-          f"   (std {date_ic['ic_std']:.4f}, ICIR {date_ic['icir']:.3f}, "
-          f"{date_ic['pct_positive']:.1f}% of {date_ic['days']} days > 0)")
 
-    return price, naive, date_ic
+    return price, naive
 
 
-# ============================================================
-# Main training
-# ============================================================
 def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Device: {device}")
-    print(f"Prediction horizon: {HORIZON} trading day")
+    print(f"Prediction horizon: {HORIZON} trading days")
     print(f"Regression target: {REGRESSION_TARGET}")
     print(f"Direction target: {DIRECTION_TARGET}")
 
-    # --------------------------------------------------------
-    # Load + feature engineering + targets
-    # --------------------------------------------------------
     df = get_data(horizon=HORIZON)
-    df = add_quant_features(df)
-    df = add_targets(df, horizon=HORIZON)
-
-    # --------------------------------------------------------
-    # Features
-    # --------------------------------------------------------
     features = [
         # Momentum / trend
         "return_1d",
         "return_5d",
+        "return_20d",
         "price_to_MA5",
         "price_to_MA20",
-        "MA5_to_MA20",
-
-        # Volatility
         "volatility_5d",
         "volatility_20d",
-
-        # Liquidity
-        "volume_change",
-        "relative_volume_20d",
-
-        # Seasonality
-        "month_sin",
-        "month_cos",
+        "relative_volume_20",
 
         # Technical indicators
         "RSI_14",
         "macd_hist",
         "bollinger_pct_b",
 
-        # Market context
-        "excess_return_1d",
+        # Market-relative
         "market_return_1d",
         "market_return_5d",
+        "excess_return_1d",
         "market_volatility",
-        "market_trend_20d",
         "market_breadth",
 
-        # Beta / idiosyncratic behavior
+        # Beta / residual
         "rolling_beta_20",
-        "rolling_beta_60",
-        "residual_return_20d",
-        "residual_return_60d",
+        "residual_return_1d",
+
+        # Price structure
+        "atr_14",
+        "dist_52w_high",
+        "dist_52w_low",
     ]
 
     required = features + [
@@ -627,50 +292,47 @@ def train_model():
     if missing:
         raise ValueError("Missing required columns: " + ", ".join(missing))
 
-    # --------------------------------------------------------
-    # Remove invalid rows before fitting scalers.
-    # --------------------------------------------------------
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=required).copy()
     df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    # --------------------------------------------------------
-    # Feature scaler: TRAIN ONLY
-    # --------------------------------------------------------
     feature_scaler = StandardScaler()
-    train_mask = df["Date"] < VALIDATION_START
+    train_mask = (df["Date"] >= TRAIN_START) & (df["Date"] < VALIDATION_START)
 
     feature_scaler.fit(df.loc[train_mask, features])
     df.loc[:, features] = feature_scaler.transform(df[features])
 
-    # --------------------------------------------------------
-    # Regression target scaler: TRAIN ONLY
-    # (a target belongs to next_date, so use targets whose target
-    # date falls inside the training period)
-    # --------------------------------------------------------
+    df[features] = df[features].clip(-FEATURE_CLIP, FEATURE_CLIP)
+
+    train_target_mask = (
+        (df["next_date"] >= TRAIN_START) & (df["next_date"] < VALIDATION_START)
+    )
+
+    lo, hi = df.loc[train_target_mask, REGRESSION_TARGET].quantile(
+        list(TARGET_WINSOR_Q)
+    )
+    print(f"\nTarget winsorization bounds (train only): [{lo:.4f}, {hi:.4f}]")
+
+    df["target_winsorized"] = df[REGRESSION_TARGET].clip(lo, hi)
+
     target_scaler = StandardScaler()
-    train_target_mask = df["next_date"] < VALIDATION_START
-    target_scaler.fit(df.loc[train_target_mask, [REGRESSION_TARGET]])
+    target_scaler.fit(df.loc[train_target_mask, ["target_winsorized"]])
 
     df["regression_target_scaled"] = target_scaler.transform(
-        df[[REGRESSION_TARGET]]
+        df[["target_winsorized"]]
     ).astype(np.float32)
 
-    # --------------------------------------------------------
-    # Training sequences
-    # --------------------------------------------------------
     train = create_sequences(
         df,
         features,
         sequence_length=SEQUENCE_LENGTH,
         target_name="regression_target_scaled",
         direction_name=DIRECTION_TARGET,
+        min_target_date=TRAIN_START,
         max_target_date=VALIDATION_START,
     )
 
-    # --------------------------------------------------------
-    # Validation sequences with historical context
-    # --------------------------------------------------------
+    # Context = the last SEQUENCE_LENGTH rows BEFORE the split starts.
     validation_context = (
         df[df["Date"] < VALIDATION_START]
         .groupby("Ticker")
@@ -697,16 +359,13 @@ def train_model():
         max_target_date=TEST_START,
     )
 
-    # --------------------------------------------------------
-    # Test sequences with historical context
-    # --------------------------------------------------------
     test_context = (
         df[df["Date"] < TEST_START]
         .groupby("Ticker")
         .tail(SEQUENCE_LENGTH)
     )
 
-    test_data = df[df["Date"] >= TEST_START]
+    test_data = df[(df["Date"] >= TEST_START) & (df["Date"] < TEST_END)]
 
     test_sequence_df = (
         pd.concat([test_context, test_data])
@@ -721,6 +380,7 @@ def train_model():
         target_name="regression_target_scaled",
         direction_name=DIRECTION_TARGET,
         min_target_date=TEST_START,
+        max_target_date=TEST_END,
     )
 
     print("\n===== DATA SHAPES =====")
@@ -729,9 +389,6 @@ def train_model():
     print("X_test:", test["X"].shape)
     print("Number of features:", len(features))
 
-    # --------------------------------------------------------
-    # Direction balance + baselines
-    # --------------------------------------------------------
     print("\n===== DIRECTION BALANCE =====")
     for name, split in [("Train", train), ("Validation", val), ("Test", test)]:
         p_up = split["direction"].mean() * 100.0
@@ -784,9 +441,6 @@ def train_model():
         pin_memory=(device.type == "cuda"),
     )
 
-    # --------------------------------------------------------
-    # Model
-    # --------------------------------------------------------
     model = LSTMModel(
         input_size=len(features),
         hidden_size=HIDDEN_SIZE,
@@ -794,9 +448,6 @@ def train_model():
         dropout=DROPOUT,
     ).to(device)
 
-    # --------------------------------------------------------
-    # Losses
-    # --------------------------------------------------------
     regression_loss_fn = torch.nn.HuberLoss(delta=1.0)
 
     positives = d_train.sum().item()
@@ -816,16 +467,14 @@ def train_model():
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2
+        optimizer, mode="min", factor=0.5, patience=4
     )
 
-    best_val_auc = -np.inf
-    best_val_loss = np.inf
     patience_counter = 0
+    best_accuracy = 0.0
+    best_log_return_rmse = float("inf")
+    saved_any = False
 
-    # --------------------------------------------------------
-    # Training
-    # --------------------------------------------------------
     for epoch in range(EPOCHS):
         model.train()
         total_train_loss = 0.0
@@ -855,9 +504,6 @@ def train_model():
 
         train_loss = total_train_loss / max(1, len(train_loader))
 
-        # ----------------------------------------------------
-        # Validation loss
-        # ----------------------------------------------------
         model.eval()
         total_val_loss = 0.0
 
@@ -883,7 +529,6 @@ def train_model():
 
         metrics = evaluate_model(model, val_loader, target_scaler, device)
         price = price_metrics(val, metrics)
-        date_ic = per_date_rank_ic(val, metrics)
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(
@@ -893,68 +538,46 @@ def train_model():
             f"ReturnRMSE={metrics['rmse_log_return']:.6f} "
             f"PriceRMSE={price['rmse']:.4f} "
             f"Acc={metrics['accuracy']:.2f}% "
-            f"BalAcc={metrics['balanced_accuracy']:.2f}% "
-            f"AUC={metrics['auc']:.4f} "
-            f"DateIC={date_ic['mean_ic']:.4f} "
             f"LR={current_lr:.6f}"
         )
 
-        # AUC is more stable than raw accuracy for checkpoint selection.
-        improved = False
+        directional_accuracy_improved = metrics["accuracy"] > best_accuracy
+        log_return_rmse_improved = metrics["rmse_log_return"] < best_log_return_rmse
 
-        if np.isfinite(metrics["auc"]):
-            if metrics["auc"] > best_val_auc + 1e-4:
-                improved = True
-            elif np.isclose(metrics["auc"], best_val_auc, atol=1e-4):
-                improved = val_loss < best_val_loss
-
-        if improved:
-            best_val_auc = metrics["auc"]
-            best_val_loss = val_loss
-            patience_counter = 0
+        if directional_accuracy_improved:
+            best_accuracy = metrics["accuracy"]
+            best_log_return_rmse = metrics["rmse_log_return"]
 
             torch.save(model.state_dict(), MODEL_PATH)
-            print("  -> Best model saved (validation AUC).")
+            saved_any = True
+            print(f"  Saved best model to {MODEL_PATH}")
+
+            patience_counter = 0
         else:
+            best_log_return_rmse = min(best_log_return_rmse, metrics["rmse_log_return"])
+
             patience_counter += 1
-            print(f"  -> No AUC improvement ({patience_counter}/{PATIENCE})")
+            print(f"  No improvement. Patience counter: {patience_counter}/{PATIENCE}")
 
         if patience_counter >= PATIENCE:
             print("\nEarly stopping triggered.")
             break
 
-    # --------------------------------------------------------
-    # Load best checkpoint
-    # --------------------------------------------------------
+    # Safety: if the strict rule never saved, save the final model so loading works.
+    if not saved_any:
+        torch.save(model.state_dict(), MODEL_PATH)
+        print(f"\nNo epoch met the save rule; saved last model to {MODEL_PATH}")
+
     print("\nLoading best model...")
     model.load_state_dict(
         torch.load(MODEL_PATH, map_location=device, weights_only=True)
     )
-
-    # --------------------------------------------------------
-    # Final metrics
-    # --------------------------------------------------------
     val_metrics = evaluate_model(model, val_loader, target_scaler, device)
     test_metrics = evaluate_model(model, test_loader, target_scaler, device)
 
     print_results("VALIDATION RESULTS", val, val_metrics)
     print_results("TEST RESULTS", test, test_metrics)
 
-    # --------------------------------------------------------
-    # Optional quant diagnostic
-    # --------------------------------------------------------
-    backtest = long_short_diagnostic(test, test_metrics)
-
-    if backtest is not None:
-        print("\n===== OPTIONAL LONG/SHORT DIAGNOSTIC =====")
-        print(f"Trading days:      {backtest['days']}")
-        print(f"Mean daily spread: {backtest['mean_daily_spread']:.6f}")
-        print(f"Annualized Sharpe: {backtest['sharpe']:.3f}")
-        print(f"Max drawdown:      {backtest['max_drawdown'] * 100:.2f}%")
-
-    # --------------------------------------------------------
-    # Save scaler information needed by inference.
-    # --------------------------------------------------------
     scaler_bundle = {
         "feature_scaler": feature_scaler,
         "target_scaler": target_scaler,
@@ -962,6 +585,8 @@ def train_model():
         "sequence_length": SEQUENCE_LENGTH,
         "regression_target": REGRESSION_TARGET,
         "direction_target": DIRECTION_TARGET,
+        "feature_clip": FEATURE_CLIP,
+        "target_winsor_bounds": (float(lo), float(hi)),
     }
 
     with open(SCALER_PATH, "wb") as f:
@@ -973,8 +598,5 @@ def train_model():
     return model
 
 
-# ============================================================
-# Main
-# ============================================================
 if __name__ == "__main__":
     train_model()

@@ -2,10 +2,6 @@ import numpy as np
 import pandas as pd
 
 
-# ============================================================
-# RSI (Relative Strength Index, 14-day)
-# ============================================================
-
 def _compute_rsi(close, period=14):
     delta = close.diff()
 
@@ -21,9 +17,6 @@ def _compute_rsi(close, period=14):
     return rsi
 
 
-# ============================================================
-# MACD (12/26 EMA difference + 9 EMA signal)
-# ============================================================
 
 def _compute_macd(close, fast=12, slow=26, signal=9):
     ema_fast = close.ewm(span=fast, adjust=False).mean()
@@ -35,47 +28,19 @@ def _compute_macd(close, fast=12, slow=26, signal=9):
     return macd_line, signal_line
 
 
-# ============================================================
-# Main Data Processing
-# ============================================================
 
 def get_data(horizon=1):
-    """
-    horizon:
-        1 -> next trading day
-        3 -> 3 trading days ahead
-        5 -> 5 trading days ahead
-
-    Main project targets:
-        1. next_log_return:
-               log(P[t+1] / P[t])
-           Used by the regression/price-prediction head.
-
-        2. direction_target:
-               1 if next-day close > today's close
-               0 otherwise
-           Used by the UP/DOWN classification head.
-
-    The raw next_return and next_close are retained so the model's
-    predicted log-return can later be converted into predicted price.
-    """
 
     df = pd.read_csv("SP500_Historical_Data_cleaned.csv")
 
     df["Date"] = pd.to_datetime(df["Date"])
 
-    # ============================================================
-    # IMPORTANT: Sort before all rolling / groupby calculations
-    # ============================================================
 
     df = (
         df.sort_values(["Ticker", "Date"])
         .reset_index(drop=True)
     )
 
-    # ============================================================
-    # TARGETS
-    # ============================================================
 
     # Future close
     df["next_close"] = (
@@ -83,33 +48,22 @@ def get_data(horizon=1):
         .shift(-horizon)
     )
 
+    df["next_date"] = (
+        df.groupby("Ticker")["Date"]
+        .shift(-horizon)
+    )
+
     # Simple next return
     df["next_return"] = (
         df["next_close"] - df["Close"]
     ) / df["Close"]
-
-    # Log return:
-    #
-    #     log(P[t+h] / P[t])
-    #
-    # This is the regression target.
     df["next_log_return"] = np.log(
         df["next_close"] / df["Close"]
     )
-
-    # UP / DOWN target:
-    #
-    # 1 -> next close is higher than today's close
-    # 0 -> next close is unchanged or lower
-    #
-    # This is the classification target.
-    df["direction_target"] = (
-        df["next_return"] > 0
+    df["direction_target"] = np.where(
+        df["next_return"] >  0.002, 1.0,
+        np.where(df["next_return"] < -0.002, 0.0, np.nan)
     ).astype(np.float32)
-
-    # ============================================================
-    # PER-TICKER FEATURES
-    # ============================================================
 
     df["return_1d"] = (
         df.groupby("Ticker")["Close"]
@@ -145,9 +99,6 @@ def get_data(horizon=1):
         df["Close"] / df["MA20"] - 1
     )
 
-    df["MA5_to_MA20"] = (
-        df["MA5"] / df["MA20"] - 1
-    )
 
     # Volatility
     df["volatility_5d"] = (
@@ -159,22 +110,16 @@ def get_data(horizon=1):
         df.groupby("Ticker")["return_1d"]
         .transform(lambda x: x.rolling(20).std())
     )
-    df["volume_change"] = (
-        df.groupby("Ticker")["Volume"]
-        .pct_change()
-    )
 
     avg_volume_20 = (
         df.groupby("Ticker")["Volume"]
         .transform(lambda x: x.rolling(20).mean())
     )
 
-    # Current volume relative to its own recent average
     df["relative_volume_20"] = (
         df["Volume"] / avg_volume_20
     ) - 1
 
-    # Calendar
     month = df["Date"].dt.month
 
     df["month_sin"] = np.sin(
@@ -185,23 +130,15 @@ def get_data(horizon=1):
         2 * np.pi * month / 12
     )
 
-    # ============================================================
-    # RSI
-    # ============================================================
-
     df["RSI_14"] = (
         df.groupby("Ticker")["Close"]
         .transform(lambda x: _compute_rsi(x, 14))
     )
 
-    # Map [0,100] approximately to [-1,1]
     df["RSI_14"] = (
         df["RSI_14"] - 50
     ) / 50
 
-    # ============================================================
-    # MACD HISTOGRAM
-    # ============================================================
 
     macd_hist_list = []
 
@@ -210,8 +147,6 @@ def get_data(horizon=1):
             group["Close"]
         )
 
-        # Normalize by price so the feature is comparable
-        # across stocks with different price levels.
         hist = (
             macd_line - signal_line
         ) / group["Close"]
@@ -224,9 +159,6 @@ def get_data(horizon=1):
         .sort_index()
     )
 
-    # ============================================================
-    # BOLLINGER %B
-    # ============================================================
 
     rolling_mean_20 = (
         df.groupby("Ticker")["Close"]
@@ -253,12 +185,6 @@ def get_data(horizon=1):
         / band_width
     )
 
-    # ============================================================
-    # MARKET / CROSS-SECTIONAL FEATURES
-    # ============================================================
-
-    # Equal-weighted market proxy from all stocks available
-    # on each date.
     market_return_by_date = (
         df.groupby("Date")["return_1d"]
         .mean()
@@ -267,13 +193,11 @@ def get_data(horizon=1):
 
     market_return_1d_by_date = market_return_by_date
 
-    # Map daily market return back to every stock row
     df["market_return_1d"] = (
         df["Date"]
         .map(market_return_1d_by_date)
     )
 
-    # Market 5-day cumulative return
     market_return_5d_by_date = (
         (1 + market_return_by_date)
         .rolling(5)
@@ -286,14 +210,11 @@ def get_data(horizon=1):
         .map(market_return_5d_by_date)
     )
 
-    # Cross-sectional excess return of the stock vs the
-    # equal-weighted market proxy.
     df["excess_return_1d"] = (
         df["return_1d"]
         - df["market_return_1d"]
     )
 
-    # Cross-sectional market volatility
     market_volatility_by_date = (
         df.groupby("Date")["return_1d"]
         .std()
@@ -305,7 +226,6 @@ def get_data(horizon=1):
         .map(market_volatility_by_date)
     )
 
-    # Fraction of stocks with positive return on that date.
     market_breadth_by_date = (
         df.groupby("Date")["return_1d"]
         .apply(lambda x: (x > 0).mean())
@@ -316,29 +236,6 @@ def get_data(horizon=1):
         .map(market_breadth_by_date)
     )
 
-    # ============================================================
-    # MARKET TREND
-    # ============================================================
-
-    market_ma20_by_date = (
-        market_return_by_date
-        .rolling(20)
-        .mean()
-    )
-
-    df["market_return_1d_vs_ma20"] = (
-        df["Date"].map(market_return_1d_by_date)
-        - df["Date"].map(market_ma20_by_date)
-    )
-
-    # ============================================================
-    # ROLLING BETA
-    #
-    # beta = Cov(stock return, market return)
-    #        / Var(market return)
-    #
-    # Computed using only returns known up to date t.
-    # ============================================================
 
     market_var_20_by_date = (
         market_return_by_date
@@ -346,24 +243,14 @@ def get_data(horizon=1):
         .var()
     )
 
-    market_var_60_by_date = (
-        market_return_by_date
-        .rolling(60)
-        .var()
-    )
 
     df["market_var_20"] = (
         df["Date"]
         .map(market_var_20_by_date)
     )
 
-    df["market_var_60"] = (
-        df["Date"]
-        .map(market_var_60_by_date)
-    )
 
     beta20_list = []
-    beta60_list = []
 
     for ticker, group in df.groupby("Ticker"):
         stock_return = group["return_1d"]
@@ -375,44 +262,36 @@ def get_data(horizon=1):
             .cov(market_return)
         )
 
-        cov60 = (
-            stock_return
-            .rolling(60)
-            .cov(market_return)
-        )
 
         beta20 = (
             cov20 / group["market_var_20"]
         )
 
-        beta60 = (
-            cov60 / group["market_var_60"]
-        )
 
         beta20.index = group.index
-        beta60.index = group.index
 
         beta20_list.append(beta20)
-        beta60_list.append(beta60)
 
     df["rolling_beta_20"] = (
         pd.concat(beta20_list)
         .sort_index()
     )
 
-    df["rolling_beta_60"] = (
-        pd.concat(beta60_list)
-        .sort_index()
-    )
 
-    # ============================================================
-    # RESIDUAL / IDIOSYNCRATIC RETURN
-    #
-    # residual = stock return - beta * market return
-    #
-    # This gives the model a market-adjusted momentum signal
-    # without using future information.
-    # ============================================================
+    # ATR-14 normalized by price
+    df["high_low"] = df["High"] - df["Low"]
+    df["atr_14"] = (
+        df.groupby("Ticker")["high_low"]
+        .transform(lambda x: x.rolling(14).mean())
+    ) / df["Close"]
+
+    # Distance from 52-week high/low
+    df["dist_52w_high"] = df.groupby("Ticker")["Close"].transform(
+        lambda x: x / x.rolling(252).max() - 1
+    )
+    df["dist_52w_low"] = df.groupby("Ticker")["Close"].transform(
+        lambda x: x / x.rolling(252).min() - 1
+    )
 
     df["residual_return_1d"] = (
         df["return_1d"]
@@ -420,16 +299,6 @@ def get_data(horizon=1):
         * df["market_return_1d"]
     )
 
-    df["residual_return_5d"] = (
-        df.groupby("Ticker")["residual_return_1d"]
-        .transform(
-            lambda x: x.rolling(5).sum()
-        )
-    )
-
-    # ============================================================
-    # CLEANUP
-    # ============================================================
 
     df.replace(
         [np.inf, -np.inf],
@@ -450,10 +319,8 @@ def get_data(horizon=1):
         "return_20d",
         "price_to_MA5",
         "price_to_MA20",
-        "MA5_to_MA20",
         "volatility_5d",
         "volatility_20d",
-        "volume_change",
         "relative_volume_20",
 
         # Technical indicators
@@ -467,13 +334,15 @@ def get_data(horizon=1):
         "excess_return_1d",
         "market_volatility",
         "market_breadth",
-        "market_return_1d_vs_ma20",
 
         # Beta / residual
         "rolling_beta_20",
-        "rolling_beta_60",
         "residual_return_1d",
-        "residual_return_5d",
+
+        # Price structure
+        "atr_14",
+        "dist_52w_high",
+        "dist_52w_low",
     ]
 
     df = df.dropna(
@@ -483,9 +352,6 @@ def get_data(horizon=1):
     return df
 
 
-# ============================================================
-# Example
-# ============================================================
 
 if __name__ == "__main__":
     data = get_data(horizon=1)
