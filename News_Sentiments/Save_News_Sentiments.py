@@ -1,21 +1,39 @@
+
 import requests
 import pandas as pd
 import time
+import os
+import numpy as np
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-API_KEY = "ADUNOG7XCWSYT5H1"
+API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 
-START_DATE = "2020-01-01"
-END_DATE = "2026-10-06"
+if not API_KEY:
+    raise ValueError(
+        "ALPHAVANTAGE_API_KEY environment variable is not set."
+    )
+
+START_DATE = "2010-01-01"
+END_DATE = "2019-12-31"
 
 BASE_URL = "https://www.alphavantage.co/query"
 
-OUTPUT_RAW = "all_news_sentiment_raw_2020_2026.csv"
-OUTPUT_DAILY = "all_ticker_news_daily_2020_2026.csv"
+OUTPUT_RAW = "all_news_sentiment_raw_2010_2019.csv"
+OUTPUT_DAILY = "all_ticker_news_daily_2010_2019.csv"
+
+# Use smaller windows.
+# Alpha Vantage may not return complete results for very large windows.
+WINDOW_MONTHS = 1
+
+# Delay between requests
+REQUEST_DELAY = 15
+
+# Retry count
+MAX_RETRIES = 3
 
 
 # ============================================================
@@ -36,36 +54,107 @@ def fetch_news(start_date, end_date):
         "function": "NEWS_SENTIMENT",
         "time_from": time_from,
         "time_to": time_to,
+
+        # Maximum allowed page size
         "limit": 1000,
+
+        # Oldest articles first
         "sort": "EARLIEST",
+
         "apikey": API_KEY
     }
 
-    print(f"\nDownloading:")
+    print("\nDownloading:")
     print(f"{start_date} -> {end_date}")
 
-    response = requests.get(
-        BASE_URL,
-        params=params,
-        timeout=60
-    )
+    for attempt in range(1, MAX_RETRIES + 1):
 
-    response.raise_for_status()
+        try:
 
-    data = response.json()
+            response = requests.get(
+                BASE_URL,
+                params=params,
+                timeout=60
+            )
 
-    if "feed" not in data:
+            response.raise_for_status()
 
-        print("\nAPI did not return feed:")
-        print(data)
+            data = response.json()
 
-        return []
+            # ------------------------------------------------
+            # API ERROR HANDLING
+            # ------------------------------------------------
 
-    return data["feed"]
+            if "feed" not in data:
+
+                print("\nAlpha Vantage did not return feed.")
+
+                if "Note" in data:
+                    print("API NOTE:")
+                    print(data["Note"])
+
+                elif "Information" in data:
+                    print("API INFORMATION:")
+                    print(data["Information"])
+
+                elif "Error Message" in data:
+                    print("API ERROR:")
+                    print(data["Error Message"])
+
+                else:
+                    print("FULL API RESPONSE:")
+                    print(data)
+
+                # Retry
+                if attempt < MAX_RETRIES:
+
+                    print(
+                        f"\nRetrying "
+                        f"({attempt}/{MAX_RETRIES})..."
+                    )
+
+                    time.sleep(30)
+
+                    continue
+
+                return []
+
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
+
+            feed = data["feed"]
+
+            print(
+                f"Articles received: {len(feed)}"
+            )
+
+            return feed
+
+        except requests.RequestException as e:
+
+            print(
+                f"\nRequest error: {e}"
+            )
+
+            if attempt < MAX_RETRIES:
+
+                print(
+                    f"Retrying "
+                    f"({attempt}/{MAX_RETRIES})..."
+                )
+
+                time.sleep(30)
+
+            else:
+
+                return []
+
+    return []
 
 
 # ============================================================
-# EXTRACT ALL TICKERS FROM EACH ARTICLE
+# EXTRACT ALL TICKERS
 # ============================================================
 
 def extract_all_tickers(feed):
@@ -79,14 +168,19 @@ def extract_all_tickers(feed):
         if not published:
             continue
 
-        published_dt = pd.to_datetime(
-            published,
-            format="%Y%m%dT%H%M%S"
-        )
+        try:
+
+            published_dt = pd.to_datetime(
+                published,
+                format="%Y%m%dT%H%M%S"
+            )
+
+        except Exception:
+
+            continue
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Loop through EVERY ticker in ticker_sentiment
+        # Every ticker mentioned in article
         # ----------------------------------------------------
 
         for ticker_data in article.get(
@@ -102,6 +196,7 @@ def extract_all_tickers(feed):
             rows.append({
 
                 # Article information
+
                 "Ticker": ticker,
 
                 "Date": published_dt.date(),
@@ -120,6 +215,7 @@ def extract_all_tickers(feed):
                 "URL": article.get("url"),
 
                 # Article-level sentiment
+
                 "Overall_Sentiment":
                     article.get(
                         "overall_sentiment_score"
@@ -131,6 +227,7 @@ def extract_all_tickers(feed):
                     ),
 
                 # Ticker-specific sentiment
+
                 "Ticker_Relevance":
                     ticker_data.get(
                         "relevance_score"
@@ -151,10 +248,14 @@ def extract_all_tickers(feed):
 
 
 # ============================================================
-# CREATE 6-MONTH WINDOWS
+# CREATE WINDOWS
 # ============================================================
 
-def create_windows(start_date, end_date):
+def create_windows(
+    start_date,
+    end_date,
+    months=1
+):
 
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
@@ -167,17 +268,19 @@ def create_windows(start_date, end_date):
 
         next_date = (
             current
-            + pd.DateOffset(months=6)
+            + pd.DateOffset(months=months)
             - pd.Timedelta(days=1)
         )
 
         if next_date > end:
             next_date = end
 
-        windows.append((
-            current.strftime("%Y-%m-%d"),
-            next_date.strftime("%Y-%m-%d")
-        ))
+        windows.append(
+            (
+                current.strftime("%Y-%m-%d"),
+                next_date.strftime("%Y-%m-%d")
+            )
+        )
 
         current = (
             next_date
@@ -185,6 +288,28 @@ def create_windows(start_date, end_date):
         )
 
     return windows
+
+
+# ============================================================
+# SAVE PROGRESS
+# ============================================================
+
+def save_raw_progress(all_rows):
+
+    if not all_rows:
+        return
+
+    temp_df = pd.DataFrame(all_rows)
+
+    temp_df.to_csv(
+        OUTPUT_RAW,
+        index=False
+    )
+
+    print(
+        f"Progress saved: "
+        f"{len(temp_df):,} rows"
+    )
 
 
 # ============================================================
@@ -197,11 +322,13 @@ def main():
 
     windows = create_windows(
         START_DATE,
-        END_DATE
+        END_DATE,
+        WINDOW_MONTHS
     )
 
     print(
-        f"\nTotal date windows: {len(windows)}"
+        f"\nTotal date windows: "
+        f"{len(windows)}"
     )
 
     # --------------------------------------------------------
@@ -224,21 +351,38 @@ def main():
             end
         )
 
-        print(
-            f"Articles received: {len(feed)}"
-        )
+        if not feed:
 
-        rows = extract_all_tickers(feed)
+            print(
+                f"No articles returned for "
+                f"{start} -> {end}"
+            )
 
-        print(
-            f"Ticker sentiment rows: {len(rows)}"
-        )
+        else:
 
-        all_rows.extend(rows)
+            rows = extract_all_tickers(feed)
 
-        # Avoid hammering API
-        time.sleep(1)
+            print(
+                f"Ticker sentiment rows: "
+                f"{len(rows):,}"
+            )
 
+            all_rows.extend(rows)
+
+            # Save after every successful window
+            save_raw_progress(all_rows)
+
+        # ----------------------------------------------------
+        # Wait between API calls
+        # ----------------------------------------------------
+
+        if i < len(windows):
+
+            print(
+                f"\nWaiting {REQUEST_DELAY} seconds..."
+            )
+
+            time.sleep(REQUEST_DELAY)
 
     # ========================================================
     # CREATE DATAFRAME
@@ -250,7 +394,6 @@ def main():
         return
 
     df = pd.DataFrame(all_rows)
-
 
     # ========================================================
     # CLEAN DATA
@@ -271,7 +414,6 @@ def main():
         errors="coerce"
     )
 
-
     # --------------------------------------------------------
     # Remove duplicate article/ticker combinations
     # --------------------------------------------------------
@@ -283,8 +425,10 @@ def main():
         ]
     )
 
-
+    # --------------------------------------------------------
     # Sort
+    # --------------------------------------------------------
+
     df = df.sort_values(
         [
             "Ticker",
@@ -292,9 +436,8 @@ def main():
         ]
     )
 
-
     # ========================================================
-    # SAVE RAW TICKER SENTIMENT
+    # SAVE RAW DATA
     # ========================================================
 
     df.to_csv(
@@ -311,13 +454,13 @@ def main():
     )
 
     print(
-        f"Tickers: {df['Ticker'].nunique()}"
+        f"Tickers: "
+        f"{df['Ticker'].nunique()}"
     )
 
     print(
         f"File: {OUTPUT_RAW}"
     )
-
 
     # ========================================================
     # DAILY AGGREGATION
@@ -367,7 +510,6 @@ def main():
         )
     )
 
-
     # ========================================================
     # WEIGHTED SENTIMENT
     # ========================================================
@@ -387,6 +529,7 @@ def main():
         )
 
         .agg(
+
             Weighted_Sum=(
                 "Weighted_Value",
                 "sum"
@@ -401,14 +544,19 @@ def main():
         .reset_index()
     )
 
+    # Avoid division by zero
 
-    weighted["Weighted_Sentiment"] = (
+    weighted["Weighted_Sentiment"] = np.where(
+        weighted["Relevance_Sum"] > 0,
+
         weighted["Weighted_Sum"]
-        / weighted["Relevance_Sum"]
+        / weighted["Relevance_Sum"],
+
+        0
     )
 
-
     daily = daily.merge(
+
         weighted[
             [
                 "Ticker",
@@ -416,16 +564,17 @@ def main():
                 "Weighted_Sentiment"
             ]
         ],
+
         on=[
             "Ticker",
             "Date"
         ],
+
         how="left"
     )
 
-
     # ========================================================
-    # POSITIVE / NEGATIVE / NEUTRAL COUNTS
+    # POSITIVE / NEGATIVE / NEUTRAL
     # ========================================================
 
     df["Positive"] = (
@@ -441,7 +590,6 @@ def main():
         &
         (df["Ticker_Sentiment"] < 0.15)
     )
-
 
     sentiment_counts = (
 
@@ -473,16 +621,17 @@ def main():
         .reset_index()
     )
 
-
     daily = daily.merge(
+
         sentiment_counts,
+
         on=[
             "Ticker",
             "Date"
         ],
+
         how="left"
     )
-
 
     # ========================================================
     # SAVE DAILY DATA
@@ -495,12 +644,10 @@ def main():
         ]
     )
 
-
     daily.to_csv(
         OUTPUT_DAILY,
         index=False
     )
-
 
     # ========================================================
     # SUMMARY
