@@ -37,7 +37,7 @@ class LSTMModel(nn.Module):
 
     def forward(self, x):
 
-        output, (hidden, cell) = self.lstm(x)
+        output, _ = self.lstm(x)
 
         last_output = output[:, -1, :]
         last_output = self.layer_norm(last_output)

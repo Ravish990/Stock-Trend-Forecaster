@@ -182,8 +182,8 @@ def extract_all_tickers(feed):
                 format="%Y%m%dT%H%M%S"
             )
 
-        except Exception:
-
+        except ValueError:
+            print(f"Skipping article with unparseable timestamp: {published!r}")
             continue
 
         # ----------------------------------------------------
@@ -279,8 +279,7 @@ def create_windows(
             - pd.Timedelta(days=1)
         )
 
-        if next_date > end:
-            next_date = end
+        next_date = min(next_date, end)
 
         windows.append(
             (
