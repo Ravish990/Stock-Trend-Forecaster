@@ -4,7 +4,7 @@ from target_data import get_data
 
 NEWS_PATH = "all_ticker_news_daily_2020_2026.csv"
 OUTPUT_PATH = "merged_news_target_data.csv"
-HORIZON = 5
+HORIZON = 1
 
 sentiment_columns = [
     "News_Count",

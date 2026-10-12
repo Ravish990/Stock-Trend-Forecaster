@@ -6,9 +6,9 @@ class LSTMModel(nn.Module):
     def __init__(
         self,
         input_size,
-        hidden_size=64,
+        hidden_size=32,
         num_layers=2,
-        dropout=0.2
+        dropout=0.5
     ):
 
         super().__init__()
@@ -29,10 +29,10 @@ class LSTMModel(nn.Module):
 
         # Deeper direction head — separate capacity for classification
         self.direction_fc = nn.Sequential(
-            nn.Linear(hidden_size, 64),
+            nn.Linear(hidden_size, 16),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1)
+            nn.Linear(16, 1)
         )
 
     def forward(self, x):
