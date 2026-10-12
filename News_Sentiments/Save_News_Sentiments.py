@@ -1,15 +1,22 @@
 
-import requests
-import pandas as pd
-import time
 import os
-import numpy as np
+import time
 
+import numpy as np
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
 # ============================================================
 # CONFIG
 # ============================================================
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
 
+load_dotenv(
+    os.path.join(PROJECT_ROOT, ".env")
+)
 API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 
 if not API_KEY:
