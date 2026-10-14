@@ -1,20 +1,21 @@
 import joblib
 import numpy as np
 import torch
+from scipy.special import expit
 from torch import nn
-from scipy.special import expit  # This applies the Sigmoid function to get percentages
 
+from Model.model import LSTMModel
 from Model.train_model import (
+    MODEL_PATH,
+    SCALER_PATH,
+    create_dataloader,
+    device,
     get_data_with_horizon,
     prepare_features,
     prepare_sequences,
-    create_dataloader,
     run_evaluation,
-    SCALER_PATH,
-    MODEL_PATH,
-    device,
 )
-from Model.model import LSTMModel
+
 
 def analyze_confidence():
     print("Loading data and model for Confidence Analysis...")
