@@ -1,24 +1,27 @@
-import joblib
 import numpy as np
 import torch
-from torch import nn
 from scipy.special import expit
+from torch import nn
 
+from Model.model import LSTMModel
 from Model.train_model import (
+    DROPOUT,
+    FEATURES,
+    HIDDEN_SIZE,
+    MODEL_PATH,
+    NUM_LAYERS,
+    create_dataloader,
+    device,
     get_data_with_horizon,
     prepare_features,
     prepare_sequences,
-    create_dataloader,
     run_evaluation,
-    SCALER_PATH,
-    MODEL_PATH,
-    device,
 )
-from Model.model import LSTMModel
+
 
 def run_backtest():
     print("Loading data and model for Backtesting...")
-    
+
     # 1. Load Data
     data = get_data_with_horizon()
     data, _ = prepare_features(data)
@@ -26,16 +29,14 @@ def run_backtest():
     test_loader = create_dataloader(test_data, shuffle=False)
 
     # 2. Load Saved Model
-    scaler = joblib.load(SCALER_PATH)
     model = LSTMModel(
-        input_size=31, 
-        hidden_size=32, 
-        num_layers=2, 
-        dropout=0.5
+        input_size=len(FEATURES),
+        hidden_size=HIDDEN_SIZE,
+        num_layers=NUM_LAYERS,
+        dropout=DROPOUT,
     ).to(device)
     
-    state = torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    model.load_state_dict(state)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
     model.eval()
 
     criterion_ret = nn.MSELoss()

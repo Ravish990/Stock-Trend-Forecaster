@@ -60,7 +60,11 @@ def get_data(horizon=1):
     df["next_log_return"] = np.log(
         df["next_close"] / df["Close"]
     )
-    df["direction_target"] = (df["next_return"] > 0).astype(np.float32)
+    df["direction_target"] = np.where(
+        df["next_close"].notna(),
+        (df["next_return"] > 0).astype(np.float32),
+        np.nan,
+    )
 
     df["return_1d"] = (
         df.groupby("Ticker")["Close"]
@@ -272,6 +276,7 @@ def get_data(horizon=1):
     df["rolling_beta_20"] = (
         pd.concat(beta20_list)
         .sort_index()
+        .clip(-5, 5)  # clip extreme outliers from near-zero market variance days
     )
 
 
@@ -306,6 +311,7 @@ def get_data(horizon=1):
     required_columns = [
         # Targets
         "next_close",
+        "next_date",
         "next_return",
         "next_log_return",
         "direction_target",

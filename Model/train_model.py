@@ -17,27 +17,28 @@ SEED = 42
 
 SEQUENCE = 10
 HORIZON = 5
-HIDDEN_SIZE = 32       
+HIDDEN_SIZE = 32
 NUM_LAYERS = 2
-DROPOUT = 0.5         
+DROPOUT = 0.5
 
-WEIGHT_DECAY = 0.005  
-LEARNING_RATE = 0.0002
+WEIGHT_DECAY = 0.005
+LEARNING_RATE = 0.0001  
 
-ALPHA = 0.5
-BETA = 1.0
+
+ALPHA = 150.0   
+BETA = 0.7
 
 EPOCHS = 50
 BATCH_SIZE = 64
 PATIENCE = 5
 
-DATA_PATH = "merged_news_target_data.csv"
+DATA_PATH = "SP500_Historical_Data_cleaned.csv"
 
-MODEL_PATH = "best_lstm_stock_model_V2_h5.pth"
-SCALER_PATH = "lstm_stock_scalers_V2_h5.pkl"
+MODEL_PATH = "best_lstm_stock_model_v5_scaled.pth"
+SCALER_PATH = "lstm_stock_scalers_v5_scaled.pkl"
 
-TRAINING_START_DATE = pd.Timestamp("2020-01-01")
-EVALUATION_START_DATE = pd.Timestamp("2024-01-01")
+TRAINING_START_DATE = pd.Timestamp("2003-01-01")  
+EVALUATION_START_DATE = pd.Timestamp("2023-01-01")
 TEST_START_DATE = pd.Timestamp("2025-01-01")
 TEST_END_DATE = pd.Timestamp("2026-02-01")
 
@@ -47,9 +48,7 @@ FEATURES = [
     "macd_hist", "bollinger_pct_b", "market_return_1d", "market_return_5d",
     "excess_return_1d", "market_volatility", "market_breadth",
     "rolling_beta_20", "residual_return_1d", "atr_14", "dist_52w_high",
-    "dist_52w_low", "News_Count", "Avg_Sentiment", "Avg_Relevance",
-    "Sentiment_Std", "Max_Sentiment", "Min_Sentiment", "Weighted_Sentiment",
-    "Positive_Count", "Negative_Count", "Neutral_Count",
+    "dist_52w_low",
 ]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -61,7 +60,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 print("=" * 70)
-print("MULTI-TICKER LSTM STOCK FORECASTER (ANTI-OVERFITTING)")
+print("MULTI-TICKER LSTM STOCK FORECASTER (BALANCED)")
 print("=" * 70)
 print(f"Device: {device}")
 print(f"Features: {len(FEATURES)}")
@@ -80,37 +79,30 @@ def build_model():
 
 
 def get_data_with_horizon():
-    data = pd.read_csv(DATA_PATH)
+    from Data_Processing.target_data import get_data
+    data = get_data(horizon=HORIZON)
+    data = data[data["Date"] >= pd.Timestamp("2002-01-01")].copy()
+
+    if "next_date" not in data.columns:
+        data["next_date"] = data.groupby("Ticker")["Date"].shift(-HORIZON)
+
     required = ["Ticker", "Date", "Close"] + FEATURES
     missing = [c for c in required if c not in data.columns]
     if missing:
-        raise ValueError(f"Missing required columns in {DATA_PATH}: {missing}")
+        raise ValueError(f"Missing columns: {missing}")
 
-    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
-    data["Close"] = pd.to_numeric(data["Close"], errors="coerce")
-    data = data.dropna(subset=["Ticker", "Date", "Close"]).copy()
     data["Ticker"] = data["Ticker"].astype(str)
-
     data = data.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    duplicates = data.duplicated(["Ticker", "Date"], keep=False)
 
+    duplicates = data.duplicated(["Ticker", "Date"], keep=False)
     if duplicates.any():
         examples = data.loc[duplicates, ["Ticker", "Date"]].head(10)
-        raise ValueError(
-            "Duplicate Ticker/Date rows detected. Resolve them before "
-            f"training.\nExamples:\n{examples.to_string(index=False)}"
+        dup_info = ", ".join(
+            f"{str(row.Ticker)[:10]}@{str(row.Date)[:10]}"
+            for _, row in examples.iterrows()
         )
+        raise ValueError(f"Duplicate Ticker/Date rows detected. Examples: {dup_info}")
 
-    grouped = data.groupby("Ticker", sort=False)
-    data["next_close"] = grouped["Close"].shift(-HORIZON)
-    data["next_date"] = grouped["Date"].shift(-HORIZON)
-    data["next_return"] = (data["next_close"] / data["Close"]) - 1.0
-    data["next_log_return"] = np.log(data["next_close"] / data["Close"])
-    data["direction_target"] = np.where(
-        data["next_close"].notna(),
-        (data["next_return"] > 0).astype(float),
-        np.nan,
-    )
     return data
 
 
@@ -184,7 +176,9 @@ def prepare_sequences(data, split):
                     and target_date <= TEST_END_DATE
                 )
             else:
-                raise ValueError(f"Unknown split: {split}")
+                allowed = {"train", "evaluation", "test"}
+                safe_split = str(split)[:20] if split not in allowed else split
+                raise ValueError(f"Unknown split: '{safe_split}'. Must be one of {allowed}.")
 
             if not keep:
                 continue
@@ -216,7 +210,7 @@ def prepare_sequences(data, split):
 def prepare_data_for_training():
     print("\nLoading dataset...")
     data = get_data_with_horizon()
-    
+
     print("\nCleaning features and fitting StandardScaler...")
     data, scaler = prepare_features(data)
 
@@ -250,7 +244,6 @@ def run_evaluation(model, loader, criterion_ret, criterion_dir, desc="Evaluating
     all_predictions, all_returns, all_logits, all_directions = [], [], [], []
 
     with torch.no_grad():
-        # --- ADDED TQDM HERE ---
         for X_batch, y_ret, y_dir in tqdm(loader, desc=desc, leave=False):
             X_batch = X_batch.to(device)
             y_ret = y_ret.to(device)
@@ -295,15 +288,12 @@ def run_evaluation(model, loader, criterion_ret, criterion_dir, desc="Evaluating
 
 
 def print_metrics(name, metrics):
-    majority_baseline = 100.0 * max(metrics["up_fraction"], 1.0 - metrics["up_fraction"])
     print(f"\n{name} METRICS")
     print("-" * 50)
     print(f"Samples                  : {metrics['samples']:,}")
     print(f"Combined loss            : {metrics['loss']:.6f}")
     print(f"Log-return RMSE          : {metrics['rmse']:.6f}")
     print(f"Direction accuracy       : {metrics['accuracy']:.2f}%")
-    print(f"Majority-class baseline  : {majority_baseline:.2f}%")
-    print(f"Actual UP fraction       : {100 * metrics['up_fraction']:.2f}%")
 
 
 def train_model():
@@ -315,6 +305,7 @@ def train_model():
     model = build_model()
     criterion_ret = nn.MSELoss()
     criterion_dir = nn.BCEWithLogitsLoss()
+    criterion_dir_eval = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -339,10 +330,7 @@ def train_model():
         train_loss_sum = 0.0
         train_samples = 0
 
-        # --- ADDED TQDM HERE ---
-        train_iterator = tqdm(train_loader, desc=f"Epoch [{epoch:02d}/{EPOCHS}] Train", leave=False)
-
-        for X_batch, y_ret, y_dir in train_iterator:
+        for X_batch, y_ret, y_dir in tqdm(train_loader, desc=f"Epoch [{epoch:02d}/{EPOCHS}] Train", leave=False):
             X_batch = X_batch.to(device)
             y_ret = y_ret.to(device)
             y_dir = y_dir.to(device)
@@ -352,10 +340,7 @@ def train_model():
             pred_ret = pred_ret.reshape(-1)
             pred_dir = pred_dir.reshape(-1)
 
-            loss_ret = criterion_ret(pred_ret, y_ret)
-            loss_dir = criterion_dir(pred_dir, y_dir)
-            loss = ALPHA * loss_ret + BETA * loss_dir
-
+            loss = ALPHA * criterion_ret(pred_ret, y_ret) + BETA * criterion_dir(pred_dir, y_dir)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -367,7 +352,7 @@ def train_model():
         avg_train_loss = train_loss_sum / train_samples
 
         eval_metrics = run_evaluation(
-            model, eval_loader, criterion_ret, criterion_dir, 
+            model, eval_loader, criterion_ret, criterion_dir_eval,
             desc=f"Epoch [{epoch:02d}/{EPOCHS}] Eval"
         )
 
@@ -396,7 +381,6 @@ def train_model():
 
             torch.save(best_state, MODEL_PATH)
             joblib.dump(scaler, SCALER_PATH)
-
             print("  --> Best validation loss improved. Model and scaler saved.")
         else:
             patience_counter += 1
@@ -433,7 +417,7 @@ def evaluate_saved_model(eval_data=None, test_data=None):
     eval_loader = create_dataloader(eval_data, shuffle=False)
     test_loader = create_dataloader(test_data, shuffle=False)
     criterion_ret = nn.MSELoss()
-    criterion_dir = nn.BCEWithLogitsLoss()
+    criterion_dir = nn.BCEWithLogitsLoss()  # unweighted for honest reporting
 
     eval_metrics = run_evaluation(loaded_model, eval_loader, criterion_ret, criterion_dir, desc="Final Eval")
     print_metrics("SAVED MODEL / EVALUATION", eval_metrics)
@@ -443,4 +427,5 @@ def evaluate_saved_model(eval_data=None, test_data=None):
 
 
 if __name__ == "__main__":
-    train_model()
+    # train_model()
+    evaluate_saved_model()
