@@ -6,9 +6,9 @@ class LSTMModel(nn.Module):
     def __init__(
         self,
         input_size,
-        hidden_size=32,
+        hidden_size=64,
         num_layers=2,
-        dropout=0.5
+        dropout=0.3
     ):
 
         super().__init__()

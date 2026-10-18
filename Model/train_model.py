@@ -1,5 +1,5 @@
 import copy
-import math
+import os
 import random
 
 import joblib
@@ -19,34 +19,30 @@ SEQUENCE = 10
 HORIZON = 5
 HIDDEN_SIZE = 32
 NUM_LAYERS = 2
-DROPOUT = 0.5
+DROPOUT = 0.4
 
-WEIGHT_DECAY = 0.005
-LEARNING_RATE = 0.0001  
-
-
-ALPHA = 150.0   
-BETA = 0.7
-
+WEIGHT_DECAY = 3e-4
+LEARNING_RATE = 3e-4
+ALPHA = 1.0          
+BETA = 1.0           
 EPOCHS = 50
-BATCH_SIZE = 64
-PATIENCE = 5
+BATCH_SIZE = 2048
+PATIENCE = 8         
+SCHED_PATIENCE = 3
 
-DATA_PATH = "SP500_Historical_Data_cleaned.csv"
+MIN_TICKERS_PER_DATE = 50
+OOS_PREDS_OUTPUT_PATH = "lstm_oos_predictions.csv"
 
-MODEL_PATH = "best_lstm_stock_model_v5_scaled.pth"
-SCALER_PATH = "lstm_stock_scalers_v5_scaled.pkl"
-
-TRAINING_START_DATE = pd.Timestamp("2003-01-01")  
-EVALUATION_START_DATE = pd.Timestamp("2023-01-01")
-TEST_START_DATE = pd.Timestamp("2025-01-01")
-TEST_END_DATE = pd.Timestamp("2026-02-01")
+SCALER_DIR = "scalers"
+MODEL_DIR = "saved_models"
 
 FEATURES = [
-    "return_1d", "return_5d", "return_20d", "price_to_MA5", "price_to_MA20",
-    "volatility_5d", "volatility_20d", "relative_volume_20", "RSI_14",
-    "macd_hist", "bollinger_pct_b", "market_return_1d", "market_return_5d",
-    "excess_return_1d", "market_volatility", "market_breadth",
+    "return_1d", "return_5d", "return_20d", 
+    "mom_12_1", "mom_6_1",
+    "price_to_MA5", "price_to_MA20",
+    "volatility_5d", "volatility_60d",
+    "relative_volume_20", "RSI_14", "bollinger_pct_b", 
+    "excess_return_1d",
     "rolling_beta_20", "residual_return_1d", "atr_14", "dist_52w_high",
     "dist_52w_low",
 ]
@@ -59,14 +55,8 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-print("=" * 70)
-print("MULTI-TICKER LSTM STOCK FORECASTER (BALANCED)")
-print("=" * 70)
-print(f"Device: {device}")
-print(f"Features: {len(FEATURES)}")
-print(f"Sequence length: {SEQUENCE}")
-print(f"Prediction horizon: {HORIZON} observations")
-print(f"Batch size: {BATCH_SIZE}")
+os.makedirs(SCALER_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 
 def build_model():
@@ -86,101 +76,76 @@ def get_data_with_horizon():
     if "next_date" not in data.columns:
         data["next_date"] = data.groupby("Ticker")["Date"].shift(-HORIZON)
 
-    required = ["Ticker", "Date", "Close"] + FEATURES
-    missing = [c for c in required if c not in data.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
-
     data["Ticker"] = data["Ticker"].astype(str)
     data = data.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    duplicates = data.duplicated(["Ticker", "Date"], keep=False)
-    if duplicates.any():
-        examples = data.loc[duplicates, ["Ticker", "Date"]].head(10)
-        dup_info = ", ".join(
-            f"{str(row.Ticker)[:10]}@{str(row.Date)[:10]}"
-            for _, row in examples.iterrows()
-        )
-        raise ValueError(f"Duplicate Ticker/Date rows detected. Examples: {dup_info}")
+    data = add_cross_sectional_rank_target(data)
 
     return data
 
 
-def prepare_features(data):
+def add_cross_sectional_rank_target(data):
     data = data.copy()
-    for col in FEATURES:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
+    raw = pd.to_numeric(data["next_log_return"], errors="coerce")
+    raw = raw.replace([np.inf, -np.inf], np.nan)
 
-    data[FEATURES] = data[FEATURES].replace([np.inf, -np.inf], np.nan)
-    data[FEATURES] = data.groupby("Ticker", sort=False)[FEATURES].ffill()
-    data = data.dropna(subset=FEATURES).copy()
-    data = data.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    scaler_fit_mask = (
-        (data["Date"] >= TRAINING_START_DATE)
-        & (data["Date"] < EVALUATION_START_DATE)
-    )
-    scaler_fit_data = data.loc[scaler_fit_mask, FEATURES]
-
-    if len(scaler_fit_data) == 0:
-        raise ValueError("No training-period rows available to fit StandardScaler.")
-
-    scaler = StandardScaler()
-    scaler.fit(scaler_fit_data)
-    scaled_features = scaler.transform(data[FEATURES])
-    data.loc[:, FEATURES] = scaled_features.astype(np.float32)
-
-    if not np.isfinite(data[FEATURES].to_numpy()).all():
-        raise ValueError("Non-finite values remain after feature scaling.")
-
-    return data, scaler
+    grp = raw.groupby(data["Date"])
+    count = grp.transform("count")
+    
+    ok = raw.notna() & (count >= MIN_TICKERS_PER_DATE)
+    
+    data["next_log_return_raw"] = raw
+    data["next_log_return"] = np.where(ok, grp.rank(pct=True), np.nan).astype(np.float32)
+    data["direction_target"] = np.where(ok, (data["next_log_return"] >= 0.5).astype(np.float32), np.nan)
+    return data
 
 
-def prepare_sequences(data, split):
+def generate_walk_forward_folds(data, start_test_year, end_test_year):
+    for test_year in range(start_test_year, end_test_year + 1):
+        val_year = test_year - 1
+        
+        train_mask = data["Date"].dt.year < val_year
+        val_mask = data["Date"].dt.year == val_year
+        test_mask = data["Date"].dt.year == test_year
+        
+        fold_data = data.copy()
+        
+        g = fold_data.groupby("Date")[FEATURES]
+        fold_data[FEATURES] = (fold_data[FEATURES] - g.transform("mean")) / (g.transform("std") + 1e-8)
+        fold_data[FEATURES] = fold_data[FEATURES].fillna(0.0)
+        
+        scaler_fit_data = fold_data.loc[train_mask, FEATURES]
+        scaler = StandardScaler()
+        scaler.fit(scaler_fit_data)
+        fold_data.loc[:, FEATURES] = scaler.transform(fold_data[FEATURES]).astype(np.float32)
+        
+        scaler_path = f"{SCALER_DIR}/scaler_{test_year}.pkl"
+        joblib.dump(scaler, scaler_path)
+        
+        train_seq = prepare_sequences(fold_data[fold_data["Date"].dt.year <= val_year], train_mask)
+        val_seq = prepare_sequences(fold_data[fold_data["Date"].dt.year <= test_year], val_mask)
+        test_seq = prepare_sequences(fold_data, test_mask)
+        
+        yield train_seq, val_seq, test_seq, scaler_path, test_year
+
+
+def prepare_sequences(data, date_mask):
     X, y_return, y_direction = [], [], []
     input_dates, target_dates, tickers = [], [], []
 
     for ticker, group in data.groupby("Ticker", sort=False):
-        group = group.sort_values("Date").reset_index(drop=True)
+        group = group.sort_values("Date").reset_index(drop=False)
         feature_array = group[FEATURES].to_numpy(dtype=np.float32)
         returns = group["next_log_return"].to_numpy(dtype=np.float32)
         directions = group["direction_target"].to_numpy(dtype=np.float32)
         dates = group["Date"].to_numpy()
         next_dates = group["next_date"].to_numpy()
+        orig_indices = group["index"].to_numpy()
 
         for i in range(SEQUENCE - 1, len(group)):
-            if (
-                not np.isfinite(returns[i])
-                or not np.isfinite(directions[i])
-                or pd.isna(next_dates[i])
-            ):
+            if not date_mask.loc[orig_indices[i]]:
                 continue
-
-            input_date = pd.Timestamp(dates[i])
-            target_date = pd.Timestamp(next_dates[i])
-
-            if split == "train":
-                keep = (
-                    input_date >= TRAINING_START_DATE
-                    and input_date < EVALUATION_START_DATE
-                    and target_date < EVALUATION_START_DATE
-                )
-            elif split == "evaluation":
-                keep = (
-                    target_date >= EVALUATION_START_DATE
-                    and target_date < TEST_START_DATE
-                )
-            elif split == "test":
-                keep = (
-                    target_date >= TEST_START_DATE
-                    and target_date <= TEST_END_DATE
-                )
-            else:
-                allowed = {"train", "evaluation", "test"}
-                safe_split = str(split)[:20] if split not in allowed else split
-                raise ValueError(f"Unknown split: '{safe_split}'. Must be one of {allowed}.")
-
-            if not keep:
+                
+            if not np.isfinite(returns[i]) or pd.isna(next_dates[i]):
                 continue
 
             window = feature_array[i - SEQUENCE + 1 : i + 1]
@@ -190,12 +155,12 @@ def prepare_sequences(data, split):
             X.append(window)
             y_return.append(returns[i])
             y_direction.append(directions[i])
-            input_dates.append(input_date)
-            target_dates.append(target_date)
+            input_dates.append(pd.Timestamp(dates[i]))
+            target_dates.append(pd.Timestamp(next_dates[i]))
             tickers.append(ticker)
 
     if not X:
-        raise ValueError(f"No sequences generated for split '{split}'.")
+        return None
 
     return (
         np.asarray(X, dtype=np.float32),
@@ -205,20 +170,6 @@ def prepare_sequences(data, split):
         np.asarray(target_dates),
         np.asarray(tickers),
     )
-
-
-def prepare_data_for_training():
-    print("\nLoading dataset...")
-    data = get_data_with_horizon()
-
-    print("\nCleaning features and fitting StandardScaler...")
-    data, scaler = prepare_features(data)
-
-    train_data = prepare_sequences(data, "train")
-    eval_data = prepare_sequences(data, "evaluation")
-    test_data = prepare_sequences(data, "test")
-
-    return train_data, eval_data, test_data, scaler
 
 
 def create_dataloader(split_data, shuffle=False):
@@ -240,8 +191,7 @@ def create_dataloader(split_data, shuffle=False):
 def run_evaluation(model, loader, criterion_ret, criterion_dir, desc="Evaluating"):
     model.eval()
     total_loss, total_samples = 0.0, 0
-    sum_squared_errors, correct_directions, positive_labels = 0.0, 0, 0
-    all_predictions, all_returns, all_logits, all_directions = [], [], [], []
+    all_predictions, all_returns = [], []
 
     with torch.no_grad():
         for X_batch, y_ret, y_dir in tqdm(loader, desc=desc, leave=False):
@@ -261,171 +211,111 @@ def run_evaluation(model, loader, criterion_ret, criterion_dir, desc="Evaluating
             total_loss += loss.item() * batch_size
             total_samples += batch_size
 
-            sum_squared_errors += (pred_ret - y_ret).square().sum().item()
-            pred_class = (pred_dir >= 0).float()
-            correct_directions += (pred_class == y_dir).sum().item()
-            positive_labels += y_dir.sum().item()
-
             all_predictions.append(pred_ret.cpu().numpy())
             all_returns.append(y_ret.cpu().numpy())
-            all_logits.append(pred_dir.cpu().numpy())
-            all_directions.append(y_dir.cpu().numpy())
-
-    rmse = math.sqrt(sum_squared_errors / total_samples)
-    accuracy = 100.0 * correct_directions / total_samples
 
     return {
         "loss": total_loss / total_samples,
-        "rmse": rmse,
-        "accuracy": accuracy,
-        "up_fraction": positive_labels / total_samples,
         "pred_return": np.concatenate(all_predictions),
         "actual_return": np.concatenate(all_returns),
-        "pred_logits": np.concatenate(all_logits),
-        "actual_direction": np.concatenate(all_directions),
-        "samples": total_samples,
     }
 
 
-def print_metrics(name, metrics):
-    print(f"\n{name} METRICS")
-    print("-" * 50)
-    print(f"Samples                  : {metrics['samples']:,}")
-    print(f"Combined loss            : {metrics['loss']:.6f}")
-    print(f"Log-return RMSE          : {metrics['rmse']:.6f}")
-    print(f"Direction accuracy       : {metrics['accuracy']:.2f}%")
+def daily_ic(pred, actual, dates, min_names=10):
+    df = pd.DataFrame({"d": dates, "p": pred, "a": actual})
+    df["pr"] = df.groupby("d")["p"].rank()
+    df["ar"] = df.groupby("d")["a"].rank()
+
+    ics = []
+    for _, g in df.groupby("d"):
+        if len(g) < min_names or g["pr"].nunique() < 2:
+            continue
+        ics.append(g["pr"].corr(g["ar"]))
+    ics = np.asarray(ics, dtype=np.float64)
+    return ics[np.isfinite(ics)]
 
 
-def train_model():
-    train_data, eval_data, test_data, scaler = prepare_data_for_training()
-
-    train_loader = create_dataloader(train_data, shuffle=True)
-    eval_loader = create_dataloader(eval_data, shuffle=False)
-
-    model = build_model()
-    criterion_ret = nn.MSELoss()
+def train_walk_forward():
+    print("\nLoading dataset...")
+    data = get_data_with_horizon()
+    
+    start_test_year = 2018
+    end_test_year = 2025
+    
+    all_oos_predictions = []
+    
+    criterion_ret = nn.MSELoss() 
     criterion_dir = nn.BCEWithLogitsLoss()
-    criterion_dir_eval = nn.BCEWithLogitsLoss()
+    
+    for train_data, val_data, test_data, scaler_path, test_year in generate_walk_forward_folds(data, start_test_year, end_test_year):
+        print(f"\n{'='*70}\nWALK-FORWARD FOLD: TEST YEAR {test_year}\n{'='*70}")
+        
+        if not train_data or not val_data or not test_data:
+            print(f"Skipping fold {test_year} due to insufficient data.")
+            continue
+            
+        train_loader = create_dataloader(train_data, shuffle=True)
+        val_loader = create_dataloader(val_data, shuffle=False)
+        test_loader = create_dataloader(test_data, shuffle=False)
+        
+        model = build_model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=SCHED_PATIENCE, min_lr=1e-6)
+        
+        best_val_loss = float("inf")
+        patience_counter = 0
+        best_state = None
+        
+        for epoch in range(1, EPOCHS + 1):
+            model.train()
+            for X_batch, y_ret, y_dir in tqdm(train_loader, desc=f"Train E{epoch}", leave=False):
+                optimizer.zero_grad(set_to_none=True)
+                pred_ret, pred_dir = model(X_batch.to(device))
+                loss = ALPHA * criterion_ret(pred_ret.reshape(-1), y_ret.to(device)) + BETA * criterion_dir(pred_dir.reshape(-1), y_dir.to(device))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+            val_metrics = run_evaluation(model, val_loader, criterion_ret, criterion_dir, desc=f"Val E{epoch}")
+            val_loss = val_metrics["loss"]
+            scheduler.step(val_loss)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch}. Best Val Loss: {best_val_loss:.4f}")
+                break
+                
+        model.load_state_dict(best_state)
+        
+        model_save_path = f"{MODEL_DIR}/lstm_fold_{test_year}.pth"
+        torch.save(best_state, model_save_path)
+        print(f"Saved model for fold {test_year} to {model_save_path}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
+        test_metrics = run_evaluation(model, test_loader, criterion_ret, criterion_dir, desc="Test")
+        
+        test_dates, test_tickers = test_data[3], test_data[5]
+        fold_df = pd.DataFrame({
+            "Date": test_dates,
+            "Ticker": test_tickers,
+            "lstm_pred": test_metrics["pred_return"],
+            "actual_rank": test_metrics["actual_return"]
+        })
+        all_oos_predictions.append(fold_df)
+        
+        ret_ic = daily_ic(test_metrics["pred_return"], test_metrics["actual_return"], test_dates)
+        print(f"Test Year {test_year} IC: {ret_ic.mean():.4f}")
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6,
-    )
+    final_oos_df = pd.concat(all_oos_predictions, ignore_index=True)
+    final_oos_df.to_csv(OOS_PREDS_OUTPUT_PATH, index=False)
+    print(f"\nSaved OOS predictions to {OOS_PREDS_OUTPUT_PATH}")
 
-    best_eval_loss = float("inf")
-    best_eval_acc = 0.0
-    best_epoch = 0
-    patience_counter = 0
-
-    print("\nStarting training...")
-    print("=" * 90)
-
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        train_loss_sum = 0.0
-        train_samples = 0
-
-        for X_batch, y_ret, y_dir in tqdm(train_loader, desc=f"Epoch [{epoch:02d}/{EPOCHS}] Train", leave=False):
-            X_batch = X_batch.to(device)
-            y_ret = y_ret.to(device)
-            y_dir = y_dir.to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            pred_ret, pred_dir = model(X_batch)
-            pred_ret = pred_ret.reshape(-1)
-            pred_dir = pred_dir.reshape(-1)
-
-            loss = ALPHA * criterion_ret(pred_ret, y_ret) + BETA * criterion_dir(pred_dir, y_dir)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            n = y_dir.numel()
-            train_loss_sum += loss.item() * n
-            train_samples += n
-
-        avg_train_loss = train_loss_sum / train_samples
-
-        eval_metrics = run_evaluation(
-            model, eval_loader, criterion_ret, criterion_dir_eval,
-            desc=f"Epoch [{epoch:02d}/{EPOCHS}] Eval"
-        )
-
-        scheduler.step(eval_metrics["loss"])
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        print(
-            f"Epoch [{epoch:02d}/{EPOCHS}] | "
-            f"Train Loss: {avg_train_loss:.6f} | "
-            f"Eval Loss: {eval_metrics['loss']:.6f} | "
-            f"Log-return RMSE: {eval_metrics['rmse']:.6f} | "
-            f"Direction Acc: {eval_metrics['accuracy']:.2f}% | "
-            f"LR: {current_lr:.2e}"
-        )
-
-        if eval_metrics["loss"] < best_eval_loss:
-            best_eval_loss = eval_metrics["loss"]
-            best_eval_acc = eval_metrics["accuracy"]
-            best_epoch = epoch
-            patience_counter = 0
-
-            best_state = copy.deepcopy({
-                key: value.detach().cpu()
-                for key, value in model.state_dict().items()
-            })
-
-            torch.save(best_state, MODEL_PATH)
-            joblib.dump(scaler, SCALER_PATH)
-            print("  --> Best validation loss improved. Model and scaler saved.")
-        else:
-            patience_counter += 1
-            print(f"  --> No validation-loss improvement. Patience: {patience_counter}/{PATIENCE}")
-
-        if patience_counter >= PATIENCE:
-            print("\nEarly stopping triggered.")
-            break
-
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"Best epoch              : {best_epoch}")
-    print(f"Best validation loss    : {best_eval_loss:.6f}")
-    print(f"Accuracy at best loss   : {best_eval_acc:.2f}%")
-
-    evaluate_saved_model(eval_data, test_data)
-
-
-def evaluate_saved_model(eval_data=None, test_data=None):
-    print("\nLoading saved model and scaler...")
-    scaler = joblib.load(SCALER_PATH)
-    loaded_model = build_model()
-    state = torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    loaded_model.load_state_dict(state)
-    loaded_model.eval()
-
-    if eval_data is None or test_data is None:
-        data = get_data_with_horizon()
-        data, _ = prepare_features(data)
-        eval_data = prepare_sequences(data, "evaluation")
-        test_data = prepare_sequences(data, "test")
-
-    eval_loader = create_dataloader(eval_data, shuffle=False)
-    test_loader = create_dataloader(test_data, shuffle=False)
-    criterion_ret = nn.MSELoss()
-    criterion_dir = nn.BCEWithLogitsLoss()  # unweighted for honest reporting
-
-    eval_metrics = run_evaluation(loaded_model, eval_loader, criterion_ret, criterion_dir, desc="Final Eval")
-    print_metrics("SAVED MODEL / EVALUATION", eval_metrics)
-
-    test_metrics = run_evaluation(loaded_model, test_loader, criterion_ret, criterion_dir, desc="Final Test")
-    print_metrics("FINAL HELD-OUT TEST", test_metrics)
 
 
 if __name__ == "__main__":
-    # train_model()
-    evaluate_saved_model()
+    train_walk_forward()

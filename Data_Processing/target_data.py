@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 
-
 def _compute_rsi(close, period=14):
     delta = close.diff()
 
@@ -16,8 +15,6 @@ def _compute_rsi(close, period=14):
 
     return rsi
 
-
-
 def _compute_macd(close, fast=12, slow=26, signal=9):
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
@@ -27,20 +24,14 @@ def _compute_macd(close, fast=12, slow=26, signal=9):
 
     return macd_line, signal_line
 
-
-
 def get_data(horizon=1):
-
     df = pd.read_csv("SP500_Historical_Data_cleaned.csv")
-
     df["Date"] = pd.to_datetime(df["Date"])
-
 
     df = (
         df.sort_values(["Ticker", "Date"])
         .reset_index(drop=True)
     )
-
 
     # Future close
     df["next_close"] = (
@@ -57,9 +48,11 @@ def get_data(horizon=1):
     df["next_return"] = (
         df["next_close"] - df["Close"]
     ) / df["Close"]
+    
     df["next_log_return"] = np.log(
         df["next_close"] / df["Close"]
     )
+    
     df["direction_target"] = np.where(
         df["next_close"].notna(),
         (df["next_return"] > 0).astype(np.float32),
@@ -81,6 +74,17 @@ def get_data(horizon=1):
         .pct_change(20)
     )
 
+    # --- NEW: Momentum Features (12-1 and 6-1) ---
+    # 12-month momentum skipping the most recent month (252 days - 21 days)
+    df["mom_12_1"] = (
+        df.groupby("Ticker")["Close"].shift(21) / df.groupby("Ticker")["Close"].shift(252)
+    ) - 1
+    
+    # 6-month momentum skipping the most recent month (126 days - 21 days)
+    df["mom_6_1"] = (
+        df.groupby("Ticker")["Close"].shift(21) / df.groupby("Ticker")["Close"].shift(126)
+    ) - 1
+
     # Moving averages
     df["MA5"] = (
         df.groupby("Ticker")["Close"]
@@ -100,16 +104,16 @@ def get_data(horizon=1):
         df["Close"] / df["MA20"] - 1
     )
 
-
     # Volatility
     df["volatility_5d"] = (
         df.groupby("Ticker")["return_1d"]
         .transform(lambda x: x.rolling(5).std())
     )
-
-    df["volatility_20d"] = (
+    
+    # --- NEW: 60-day Volatility ---
+    df["volatility_60d"] = (
         df.groupby("Ticker")["return_1d"]
-        .transform(lambda x: x.rolling(20).std())
+        .transform(lambda x: x.rolling(60).std())
     )
 
     avg_volume_20 = (
@@ -139,27 +143,6 @@ def get_data(horizon=1):
     df["RSI_14"] = (
         df["RSI_14"] - 50
     ) / 50
-
-
-    macd_hist_list = []
-
-    for ticker, group in df.groupby("Ticker"):
-        macd_line, signal_line = _compute_macd(
-            group["Close"]
-        )
-
-        hist = (
-            macd_line - signal_line
-        ) / group["Close"]
-
-        hist.index = group.index
-        macd_hist_list.append(hist)
-
-    df["macd_hist"] = (
-        pd.concat(macd_hist_list)
-        .sort_index()
-    )
-
 
     rolling_mean_20 = (
         df.groupby("Ticker")["Close"]
@@ -191,52 +174,14 @@ def get_data(horizon=1):
         .mean()
         .sort_index()
     )
-
-    market_return_1d_by_date = market_return_by_date
-
-    df["market_return_1d"] = (
-        df["Date"]
-        .map(market_return_1d_by_date)
-    )
-
-    market_return_5d_by_date = (
-        (1 + market_return_by_date)
-        .rolling(5)
-        .apply(np.prod, raw=True)
-        - 1
-    )
-
-    df["market_return_5d"] = (
-        df["Date"]
-        .map(market_return_5d_by_date)
-    )
+    
+    # Need to map this to the dataframe so we can calculate excess and beta
+    df["market_return_1d"] = df["Date"].map(market_return_by_date)
 
     df["excess_return_1d"] = (
         df["return_1d"]
         - df["market_return_1d"]
     )
-
-    market_volatility_by_date = (
-        df.groupby("Date")["return_1d"]
-        .std()
-        .sort_index()
-    )
-
-    df["market_volatility"] = (
-        df["Date"]
-        .map(market_volatility_by_date)
-    )
-
-    market_breadth_by_date = (
-        df.groupby("Date")["return_1d"]
-        .apply(lambda x: (x > 0).mean())
-    )
-
-    df["market_breadth"] = (
-        df["Date"]
-        .map(market_breadth_by_date)
-    )
-
 
     market_var_20_by_date = (
         market_return_by_date
@@ -244,12 +189,10 @@ def get_data(horizon=1):
         .var()
     )
 
-
     df["market_var_20"] = (
         df["Date"]
         .map(market_var_20_by_date)
     )
-
 
     beta20_list = []
 
@@ -263,11 +206,9 @@ def get_data(horizon=1):
             .cov(market_return)
         )
 
-
         beta20 = (
             cov20 / group["market_var_20"]
         )
-
 
         beta20.index = group.index
 
@@ -278,7 +219,6 @@ def get_data(horizon=1):
         .sort_index()
         .clip(-5, 5)  # clip extreme outliers from near-zero market variance days
     )
-
 
     # ATR-14 normalized by price
     df["high_low"] = df["High"] - df["Low"]
@@ -301,7 +241,6 @@ def get_data(horizon=1):
         * df["market_return_1d"]
     )
 
-
     df.replace(
         [np.inf, -np.inf],
         np.nan,
@@ -320,23 +259,20 @@ def get_data(horizon=1):
         "return_1d",
         "return_5d",
         "return_20d",
+        "mom_12_1",       # NEW
+        "mom_6_1",        # NEW
         "price_to_MA5",
         "price_to_MA20",
         "volatility_5d",
-        "volatility_20d",
+        "volatility_60d", # NEW
         "relative_volume_20",
 
         # Technical indicators
         "RSI_14",
-        "macd_hist",
         "bollinger_pct_b",
 
         # Market-relative
-        "market_return_1d",
-        "market_return_5d",
         "excess_return_1d",
-        "market_volatility",
-        "market_breadth",
 
         # Beta / residual
         "rolling_beta_20",
@@ -353,8 +289,6 @@ def get_data(horizon=1):
     ).copy()
 
     return df
-
-
 
 if __name__ == "__main__":
     data = get_data(horizon=1)
