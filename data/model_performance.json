@@ -1,0 +1,61 @@
+{
+  "evaluation_period": "2025-01-01 to 2026-02-01",
+  "sample_size": 7140,
+  "evaluated_tickers_count": 30,
+  "model_name": "best_lstm_stock_model_v3_h5.pth",
+  "forecast_horizon": "5 trading days",
+  "directional_accuracy_pct": 54.12,
+  "precision": 0.5468,
+  "recall": 0.9548,
+  "brier_score": 0.251,
+  "log_loss": 0.6962,
+  "rmse_log_return": 0.0559,
+  "rmse_return_pct": 5.61,
+  "up_fraction_pct": 54.85,
+  "majority_baseline_pct": 54.85,
+  "calibration": [
+    {
+      "bin_range": "30%-40%",
+      "predicted_prob": 34.81058120727539,
+      "actual_freq": 54.285714285714285,
+      "count": 35
+    },
+    {
+      "bin_range": "40%-45%",
+      "predicted_prob": 42.50495529174805,
+      "actual_freq": 50.0,
+      "count": 18
+    },
+    {
+      "bin_range": "45%-50%",
+      "predicted_prob": 48.69833755493164,
+      "actual_freq": 67.94871794871796,
+      "count": 156
+    },
+    {
+      "bin_range": "50%-55%",
+      "predicted_prob": 52.633487701416016,
+      "actual_freq": 54.93773022276793,
+      "count": 5701
+    },
+    {
+      "bin_range": "55%-60%",
+      "predicted_prob": 57.10356140136719,
+      "actual_freq": 50.77186963979416,
+      "count": 583
+    },
+    {
+      "bin_range": "60%-70%",
+      "predicted_prob": 64.1651382446289,
+      "actual_freq": 54.41527446300716,
+      "count": 419
+    },
+    {
+      "bin_range": "70%-100%",
+      "predicted_prob": 74.56037902832031,
+      "actual_freq": 61.48148148148148,
+      "count": 135
+    }
+  ],
+  "description": "Out-of-sample chronological test set evaluation strictly isolated from model training period (2020-2023)."
+}

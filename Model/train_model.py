@@ -33,8 +33,8 @@ PATIENCE = 5
 
 DATA_PATH = "merged_news_target_data.csv"
 
-MODEL_PATH = "best_lstm_stock_model_V2_h5.pth"
-SCALER_PATH = "lstm_stock_scalers_V2_h5.pkl"
+MODEL_PATH = "best_lstm_stock_model_v3_h5.pth"
+SCALER_PATH = "lstm_stock_scalers_V3_h5.pkl"
 
 TRAINING_START_DATE = pd.Timestamp("2020-01-01")
 EVALUATION_START_DATE = pd.Timestamp("2024-01-01")
@@ -295,14 +295,12 @@ def run_evaluation(model, loader, criterion_ret, criterion_dir, desc="Evaluating
 
 
 def print_metrics(name, metrics):
-    majority_baseline = 100.0 * max(metrics["up_fraction"], 1.0 - metrics["up_fraction"])
     print(f"\n{name} METRICS")
     print("-" * 50)
     print(f"Samples                  : {metrics['samples']:,}")
     print(f"Combined loss            : {metrics['loss']:.6f}")
     print(f"Log-return RMSE          : {metrics['rmse']:.6f}")
     print(f"Direction accuracy       : {metrics['accuracy']:.2f}%")
-    print(f"Majority-class baseline  : {majority_baseline:.2f}%")
     print(f"Actual UP fraction       : {100 * metrics['up_fraction']:.2f}%")
 
 

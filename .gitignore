@@ -1,0 +1,30 @@
+# Virtual environment
+stockenv312/
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Large datasets (>100MB blocked by GitHub)
+merged_news_target_data.csv
+SP500_Historical_Data.csv
+SP500_Historical_Data_cleaned.csv
+
+# Frontend dependencies and production builds
+Frontend/node_modules/
+Frontend/dist/
+Frontend/dist-ssr/
+Frontend/*.local
+
+# Environment variables & local IDE settings
+.env
+.vscode/
+.idea/
+*.swp
+*.swo

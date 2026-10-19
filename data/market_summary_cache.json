@@ -1,0 +1,15 @@
+{
+  "total_supported_tickers": 471,
+  "successfully_predicted_tickers": 471,
+  "missing_data_tickers": 0,
+  "predicted_up_count": 235,
+  "predicted_down_count": 236,
+  "avg_predicted_return": 0.4,
+  "highest_predicted_probability": 73.8,
+  "lowest_predicted_probability": 33.2,
+  "highest_probability_ticker": "BKNG",
+  "latest_data_date": "2026-02-19",
+  "prediction_generated_at": "2026-10-18T23:55:46Z",
+  "model_name": "best_lstm_stock_model_v3_h5.pth",
+  "forecast_horizon": 5
+}
