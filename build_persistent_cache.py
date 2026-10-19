@@ -13,9 +13,11 @@ from Backend.core.config import (
     COMPANY_METADATA_PATH,
     AAPL_COMPARISON_PATH,
 )
+import sys
 from Backend.services.company_mapping import CompanyMappingService
-from Model.model import LSTMModel
-from Model.train_model import FEATURES, SEQUENCE
+from Model.model import LSTMModel, AttentionLSTMModel, CrossSectionalScaler
+sys.modules['__main__'].CrossSectionalScaler = CrossSectionalScaler
+from Model.train_model import FEATURES, SEQUENCE, STOCK_FEATURES, MACRO_FEATURES
 
 print("Building persistent cache for instant API responses...")
 t0 = time.time()
@@ -34,10 +36,30 @@ df = df.dropna(subset=["Ticker", "Date", "Close"]).sort_values(["Ticker", "Date"
 latest_date_str = df["Date"].max().strftime("%Y-%m-%d")
 print(f"Dataset loaded in {time.time()-t0:.2f}s, latest date: {latest_date_str}")
 
-# 3. Model & Scaler
+# 3. Model & Scaler Loading with Dynamic Architecture Detection
 scaler = joblib.load(SCALER_PATH)
-model = LSTMModel(input_size=len(FEATURES), hidden_size=32, num_layers=2, dropout=0.5)
-model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu", weights_only=True))
+state = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+
+if "attention.attn.0.weight" in state:
+    hidden_size = state["attention.attn.0.weight"].shape[1]
+    model = AttentionLSTMModel(
+        input_size=len(FEATURES),
+        hidden_size=hidden_size,
+        num_layers=2,
+        dropout=0.25,
+    )
+    print(f"Loaded AttentionLSTMModel (hidden_size={hidden_size}) from {MODEL_PATH.name}")
+else:
+    hidden_size = state["lstm.weight_ih_l0"].shape[0] // 4
+    model = LSTMModel(
+        input_size=len(FEATURES),
+        hidden_size=hidden_size,
+        num_layers=2,
+        dropout=0.5,
+    )
+    print(f"Loaded LSTMModel (hidden_size={hidden_size}) from {MODEL_PATH.name}")
+
+model.load_state_dict(state)
 model.eval()
 
 # 4. Batch predictions
@@ -49,6 +71,8 @@ history_cache = {}
 
 grouped = df.groupby("Ticker", sort=True)
 for ticker, group in grouped:
+    if ticker == "SNDK":
+        continue
     # Save recent 90-day history for fast charts
     recent_90 = group.tail(90)
     history_items = []
@@ -104,12 +128,31 @@ for ticker, group in grouped:
 
 print(f"Extracted {len(valid_tickers)} valid windows and {len(missing_tickers)} missing tickers.")
 
-# PyTorch batch inference
+# Feature normalization
 stacked = np.stack(windows)
 N, S, F = stacked.shape
-reshaped = stacked.reshape(N * S, F)
-scaled_reshaped = scaler.transform(reshaped)
-scaled_windows = scaled_reshaped.reshape(N, S, F)
+
+is_alpha_model = hasattr(scaler, "macro_scaler")
+
+if is_alpha_model:
+    # 1. Standardize stock features cross-sectionally across tickers for each sequence step
+    stock_idx = [FEATURES.index(f) for f in STOCK_FEATURES]
+    for step in range(S):
+        step_vals = stacked[:, step, stock_idx]
+        m = np.nanmean(step_vals, axis=0, keepdims=True)
+        s = np.nanstd(step_vals, axis=0, keepdims=True) + 1e-6
+        stacked[:, step, stock_idx] = np.clip((step_vals - m) / s, -5.0, 5.0)
+
+    # 2. Scale macro features using macro_scaler
+    macro_idx = [FEATURES.index(f) for f in MACRO_FEATURES]
+    reshaped_macro = stacked[:, :, macro_idx].reshape(N * S, len(macro_idx))
+    scaled_macro = scaler.macro_scaler.transform(reshaped_macro)
+    stacked[:, :, macro_idx] = np.clip(scaled_macro.reshape(N, S, len(macro_idx)), -5.0, 5.0)
+    scaled_windows = stacked
+else:
+    reshaped = stacked.reshape(N * S, F)
+    scaled_reshaped = scaler.transform(reshaped)
+    scaled_windows = scaled_reshaped.reshape(N, S, F)
 
 batch_tensor = torch.tensor(scaled_windows, dtype=torch.float32)
 with torch.no_grad():
@@ -118,14 +161,20 @@ with torch.no_grad():
 raw_logits = dir_batch.squeeze().cpu().numpy()
 raw_rets = ret_batch.squeeze().cpu().numpy()
 
-# Calibrate logits with median neutral centering to eliminate majority-class upward bias
-logit_median = float(np.median(raw_logits))
-calibrated_logits = raw_logits - logit_median
-prob_ups = 1.0 / (1.0 + np.exp(-calibrated_logits))
-
-# Calibrate returns consistently around neutral market baseline so return sign matches direction
-ret_median = float(np.median(raw_rets))
-calibrated_rets = raw_rets - ret_median
+if is_alpha_model:
+    # Calibrated Alpha Return Reconstruction:
+    # Total expected return = market drift + calibrated alpha
+    market_drift = 0.0043  # +0.43% 5-day market baseline
+    alpha_std = np.std(raw_rets) + 1e-6
+    calibrated_alphas = (raw_rets - np.mean(raw_rets)) / alpha_std * 0.028
+    pred_total_rets = market_drift + calibrated_alphas
+    
+    # Calibrated probability corresponding to expected return
+    z_scores = pred_total_rets / 0.035
+    prob_ups = 1.0 / (1.0 + np.exp(-z_scores * 1.5))
+else:
+    prob_ups = 1.0 / (1.0 + np.exp(-raw_logits))
+    pred_total_rets = raw_rets
 
 now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -140,20 +189,24 @@ def classify_confidence(p):
 for i, ticker in enumerate(valid_tickers):
     latest_close = latest_rows[i]["Close"]
     latest_date = latest_rows[i]["Date"]
+    log_ret = float(pred_total_rets[i])
     prob_up = float(prob_ups[i] * 100.0)
-    prob_down = float(max(0.0, 100.0 - prob_up))
-    direction = "UP" if prob_up > 50.0 else "DOWN"
-    confidence = classify_confidence(prob_up)
 
-    log_ret = float(calibrated_rets[i])
-    # Enforce strict consistency: DOWN predictions have negative return, UP predictions have positive return
-    if direction == "DOWN" and log_ret >= 0:
-        log_ret = -0.002
-    elif direction == "UP" and log_ret <= 0:
-        log_ret = 0.002
-
+    # Predicted price compared directly to current close:
+    # If predicted price > latest_close, stock beats current price -> UP
+    # If predicted price <= latest_close, stock drops -> DOWN
     pred_price = float(latest_close * np.exp(log_ret))
     pred_return_pct = float(((pred_price / latest_close) - 1.0) * 100.0)
+
+    if pred_return_pct > 0:
+        direction = "UP"
+        prob_up = max(50.1, prob_up)
+    else:
+        direction = "DOWN"
+        prob_up = min(49.9, prob_up)
+
+    prob_down = float(max(0.0, 100.0 - prob_up))
+    confidence = classify_confidence(prob_up)
 
     meta = meta_map.get(ticker, {})
     c_name = meta.get("company_name")
@@ -174,7 +227,7 @@ for i, ticker in enumerate(valid_tickers):
         "confidence_label": confidence,
         "prediction_date": now_iso,
         "forecast_horizon": 5,
-        "model_name": "best_lstm_stock_model_v3_h5.pth",
+        "model_name": MODEL_PATH.name,
     }
 
 preds_list = list(predictions.values())
@@ -185,7 +238,7 @@ highest_pred = max(preds_list, key=lambda x: x["probability_up"])
 lowest_pred = min(preds_list, key=lambda x: x["probability_up"])
 
 summary = {
-    "total_supported_tickers": 472,
+    "total_supported_tickers": 471,
     "successfully_predicted_tickers": len(predictions),
     "missing_data_tickers": len(missing_tickers),
     "predicted_up_count": up_count,
@@ -196,30 +249,29 @@ summary = {
     "highest_probability_ticker": highest_pred["ticker"],
     "latest_data_date": latest_date_str,
     "prediction_generated_at": now_iso,
-    "model_name": "best_lstm_stock_model_v3_h5.pth",
+    "model_name": MODEL_PATH.name,
     "forecast_horizon": 5,
 }
 
-# Save caches
-data_dir = Path("data")
-data_dir.mkdir(parents=True, exist_ok=True)
+print(f"\nCache Summary:")
+print(f"Total Tickers: {len(predictions)}")
+print(f"Predicted UP: {up_count} ({up_count/len(predictions)*100:.1f}%)")
+print(f"Predicted DOWN: {down_count} ({down_count/len(predictions)*100:.1f}%)")
+print(f"Avg Predicted Return: {avg_ret:.2f}%")
 
-with open(data_dir / "predictions_cache.json", "w", encoding="utf-8") as f:
+cache_dir = Path("data")
+cache_dir.mkdir(exist_ok=True)
+
+with open(cache_dir / "predictions_cache.json", "w", encoding="utf-8") as f:
     json.dump(predictions, f, indent=2)
 
-with open(data_dir / "stock_history_cache.json", "w", encoding="utf-8") as f:
+with open(cache_dir / "stock_history_cache.json", "w", encoding="utf-8") as f:
     json.dump(history_cache, f)
 
-with open(data_dir / "market_summary_cache.json", "w", encoding="utf-8") as f:
+with open(cache_dir / "market_summary_cache.json", "w", encoding="utf-8") as f:
     json.dump(summary, f, indent=2)
 
-with open(data_dir / "missing_tickers_cache.json", "w", encoding="utf-8") as f:
+with open(cache_dir / "missing_tickers_cache.json", "w", encoding="utf-8") as f:
     json.dump(missing_tickers, f, indent=2)
 
-print("Persistent caches built successfully in data/:")
-print(f"  - predictions_cache.json ({len(predictions)} items)")
-print(f"  - stock_history_cache.json ({len(history_cache)} tickers)")
-print(f"  - market_summary_cache.json (UP: {up_count}, DOWN: {down_count}, AVG: {avg_ret:.2f}%)")
-print(f"  - missing_tickers_cache.json ({len(missing_tickers)} items)")
-print(f"Total time: {time.time()-t0:.2f}s")
-
+print(f"All caches successfully generated and saved to {cache_dir}/ in {time.time()-t0:.2f}s!")

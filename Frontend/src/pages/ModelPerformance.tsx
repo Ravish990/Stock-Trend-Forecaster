@@ -123,8 +123,8 @@ export const ModelPerformance: React.FC = () => {
 
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
           <div className="text-xs text-slate-400 font-medium">Active Checkpoint</div>
-          <div className="mt-1 text-sm font-bold font-mono text-emerald-400">best_lstm_stock_model_V2_h5.pth</div>
-          <div className="text-[11px] text-slate-500 mt-1">PyTorch 2-layer LSTM with LayerNorm</div>
+          <div className="mt-1 text-sm font-bold font-mono text-emerald-400">best_lstm_stock_model_v4_h5.pth</div>
+          <div className="text-[11px] text-slate-500 mt-1">AttentionLSTM with Temporal Attention & Alpha Calibration</div>
         </div>
       </div>
 
@@ -231,7 +231,7 @@ export const ModelPerformance: React.FC = () => {
                 <td className="py-2.5 pl-3 font-semibold text-rose-400">DOWN — High confidence</td>
                 <td className="px-3 py-2.5 font-mono text-slate-300">&lt; 40.0%</td>
                 <td className="px-3 py-2.5 font-bold text-rose-400">DOWN</td>
-                <td className="px-3 py-2.5 text-right font-bold text-rose-400">54.3%</td>
+                <td className="px-3 py-2.5 text-right font-bold text-rose-400">44.3%</td>
                 <td className="py-2.5 pr-3 text-right text-slate-400">Strong conviction short signal</td>
               </tr>
             </tbody>

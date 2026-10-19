@@ -19,9 +19,11 @@ from Backend.core.config import (
     MODEL_PERFORMANCE_PATH,
     SCALER_PATH,
 )
+import sys
 from Backend.services.company_mapping import CompanyMappingService
-from Model.model import LSTMModel
-from Model.train_model import FEATURES, SEQUENCE
+from Model.model import LSTMModel, AttentionLSTMModel, CrossSectionalScaler
+sys.modules['__main__'].CrossSectionalScaler = CrossSectionalScaler
+from Model.train_model import FEATURES, SEQUENCE, STOCK_FEATURES, MACRO_FEATURES
 
 
 class PredictionService:
@@ -103,18 +105,30 @@ class PredictionService:
             return self.model, self.scaler
 
         scaler = joblib.load(self.scaler_path)
-        model = LSTMModel(
-            input_size=len(FEATURES),
-            hidden_size=32,
-            num_layers=2,
-            dropout=0.5,
-        )
         state = torch.load(self.model_path, map_location="cpu", weights_only=True)
+
+        if "attention.attn.0.weight" in state:
+            hidden_size = state["attention.attn.0.weight"].shape[1]
+            model = AttentionLSTMModel(
+                input_size=len(FEATURES),
+                hidden_size=hidden_size,
+                num_layers=2,
+                dropout=0.25,
+            )
+        else:
+            hidden_size = state["lstm.weight_ih_l0"].shape[0] // 4
+            model = LSTMModel(
+                input_size=len(FEATURES),
+                hidden_size=hidden_size,
+                num_layers=2,
+                dropout=0.5,
+            )
         model.load_state_dict(state)
         model.eval()
 
         self.model = model
         self.scaler = scaler
+        self.model_name = self.model_path.name
         return model, scaler
 
     @staticmethod
@@ -202,12 +216,31 @@ class PredictionService:
         if not valid_tickers:
             return {}
 
-        # Vectorized scaling across all tickers: (N, SEQUENCE, FEATURES)
+        # Feature normalization
         stacked = np.stack(windows)
         num_tickers, seq_len, num_features = stacked.shape
-        reshaped = stacked.reshape(num_tickers * seq_len, num_features)
-        scaled_reshaped = scaler.transform(reshaped)
-        scaled_windows = scaled_reshaped.reshape(num_tickers, seq_len, num_features)
+
+        is_alpha_model = hasattr(scaler, "macro_scaler")
+
+        if is_alpha_model:
+            # 1. Standardize stock features cross-sectionally across tickers for each sequence step
+            stock_idx = [FEATURES.index(f) for f in STOCK_FEATURES]
+            for step in range(seq_len):
+                step_vals = stacked[:, step, stock_idx]
+                m = np.nanmean(step_vals, axis=0, keepdims=True)
+                s = np.nanstd(step_vals, axis=0, keepdims=True) + 1e-6
+                stacked[:, step, stock_idx] = np.clip((step_vals - m) / s, -5.0, 5.0)
+
+            # 2. Scale macro features using macro_scaler
+            macro_idx = [FEATURES.index(f) for f in MACRO_FEATURES]
+            reshaped_macro = stacked[:, :, macro_idx].reshape(num_tickers * seq_len, len(macro_idx))
+            scaled_macro = scaler.macro_scaler.transform(reshaped_macro)
+            stacked[:, :, macro_idx] = np.clip(scaled_macro.reshape(num_tickers, seq_len, len(macro_idx)), -5.0, 5.0)
+            scaled_windows = stacked
+        else:
+            reshaped = stacked.reshape(num_tickers * seq_len, num_features)
+            scaled_reshaped = scaler.transform(reshaped)
+            scaled_windows = scaled_reshaped.reshape(num_tickers, seq_len, num_features)
 
         # PyTorch batch inference
         batch_tensor = torch.tensor(scaled_windows, dtype=torch.float32)
@@ -217,12 +250,20 @@ class PredictionService:
         raw_logits = pred_dir_batch.squeeze().cpu().numpy()
         raw_rets = pred_ret_batch.squeeze().cpu().numpy()
 
-        logit_median = float(np.median(raw_logits))
-        calibrated_logits = raw_logits - logit_median
-        prob_ups = 1.0 / (1.0 + np.exp(-calibrated_logits))
+        if is_alpha_model:
+            # Calibrated Alpha Return Reconstruction:
+            # Total expected return = market drift + calibrated alpha
+            market_drift = 0.0043  # +0.43% 5-day market baseline
+            alpha_std = np.std(raw_rets) + 1e-6
+            calibrated_alphas = (raw_rets - np.mean(raw_rets)) / alpha_std * 0.028
+            pred_total_rets = market_drift + calibrated_alphas
 
-        ret_median = float(np.median(raw_rets))
-        calibrated_rets = raw_rets - ret_median
+            # Calibrated probability corresponding to expected return
+            z_scores = pred_total_rets / 0.035
+            prob_ups = 1.0 / (1.0 + np.exp(-z_scores * 1.5))
+        else:
+            prob_ups = 1.0 / (1.0 + np.exp(-raw_logits))
+            pred_total_rets = raw_rets
 
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.prediction_generated_at = now_iso
@@ -231,19 +272,24 @@ class PredictionService:
         for i, ticker in enumerate(valid_tickers):
             latest_close = latest_rows[i]["Close"]
             latest_date = latest_rows[i]["Date"]
+            log_ret = float(pred_total_rets[i])
             prob_up = float(prob_ups[i] * 100.0)
-            prob_down = float(max(0.0, 100.0 - prob_up))
-            direction = "UP" if prob_up > 50.0 else "DOWN"
-            confidence = self._classify_confidence(prob_up)
 
-            log_ret = float(calibrated_rets[i])
-            if direction == "DOWN" and log_ret >= 0:
-                log_ret = -0.002
-            elif direction == "UP" and log_ret <= 0:
-                log_ret = 0.002
-
+            # Pure raw predicted price compared directly to current close:
+            # If predicted price > latest_close, the stock beats its current price -> UP
+            # If predicted price <= latest_close, the stock drops or stays flat -> DOWN
             pred_price = float(latest_close * np.exp(log_ret))
             pred_return_pct = float(((pred_price / latest_close) - 1.0) * 100.0)
+
+            if pred_return_pct > 0:
+                direction = "UP"
+                prob_up = max(50.1, prob_up)
+            else:
+                direction = "DOWN"
+                prob_up = min(49.9, prob_up)
+
+            prob_down = float(max(0.0, 100.0 - prob_up))
+            confidence = self._classify_confidence(prob_up)
 
             meta = meta_map.get(ticker, {})
             predictions[ticker] = {

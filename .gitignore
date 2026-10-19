@@ -4,7 +4,7 @@ venv/
 .venv/
 env/
 
-# Python cache
+# Python cache & testing
 __pycache__/
 *.py[cod]
 *$py.class
@@ -15,6 +15,26 @@ __pycache__/
 merged_news_target_data.csv
 SP500_Historical_Data.csv
 SP500_Historical_Data_cleaned.csv
+
+# Temporary news / prediction dump CSVs
+all_news_sentiment_raw_2020_2026.csv
+all_ticker_news_daily_2020_2026.csv
+lstm_oos_predictions.csv
+aapl_feb2026_forecast_comparison.csv
+
+# Experimental / diagnostic plots and images
+*.png
+
+# Experimental directories
+scratch/
+saved_models/
+scalers/
+
+# Ignore old/trial model checkpoints and scalers (keep ONLY production V4_h5)
+*.pth
+*.pkl
+!best_lstm_stock_model_v4_h5.pth
+!lstm_stock_scalers_V4_h5.pkl
 
 # Frontend dependencies and production builds
 Frontend/node_modules/

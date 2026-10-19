@@ -79,3 +79,21 @@ def root():
         "status": "online",
         "documentation": "/docs",
     }
+
+
+@app.post("/api/admin/reload-cache", tags=["system"])
+@app.get("/api/admin/reload-cache", tags=["system"])
+def reload_cache():
+    """Reload persistent caches and refresh in-memory predictions."""
+    loaded = prediction_service._load_persistent_caches()
+    if not loaded:
+        prediction_service._prediction_cache.clear()
+        prediction_service.warmup_all_predictions()
+    return {
+        "status": "success",
+        "message": "Cache successfully reloaded into memory",
+        "model_name": prediction_service.model_name,
+        "predicted_up_count": sum(1 for p in prediction_service._prediction_cache.values() if p["predicted_direction"] == "UP"),
+        "predicted_down_count": sum(1 for p in prediction_service._prediction_cache.values() if p["predicted_direction"] == "DOWN"),
+        "cached_tickers_count": len(prediction_service._prediction_cache),
+    }
