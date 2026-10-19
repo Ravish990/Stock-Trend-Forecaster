@@ -92,8 +92,8 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'all_stocks', label: 'All Stocks (471)', icon: Building2 },
     { id: 'predictions', label: 'Market Predictions', icon: LineChart },
     { id: 'leaderboard', label: 'Leaderboard', icon: Trophy },
-    { id: 'performance', label: 'Model Performance', icon: Activity },
-    { id: 'validation', label: 'Validation Audit', icon: CheckCircle2 },
+    // { id: 'performance', label: 'Model Performance', icon: Activity },
+    // { id: 'validation', label: 'Validation Audit', icon: CheckCircle2 },
   ];
 
   return (
@@ -126,7 +126,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             <Search className="absolute left-3 h-4 w-4 text-slate-400 pointer-events-none" />
             <input
               type="text"
-              placeholder="Search ticker (AAPL) or company..."
+              placeholder="Search ticker (MSFT) or company..."
               value={searchValue}
               onChange={(e) => setSearchValue(e.target.value)}
               onFocus={() => {
@@ -147,7 +147,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {/* Auto-suggest Live Dropdown */}
           {showDropdown && suggestions.length > 0 && (
-            <div className="absolute left-0 right-0 top-full mt-1.5 rounded-xl border border-slate-800 bg-slate-900/98 shadow-2xl backdrop-blur-xl overflow-hidden z-50">
+            <div className="absolute left-0 right-0 top-full mt-1.5 rounded-xl border border-slate-800 bg-slate-950 shadow-2xl backdrop-blur-xl overflow-hidden z-50">
               <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider font-semibold text-slate-500 border-b border-slate-800/80 bg-slate-950/60">
                 Matching Companies ({suggestions.length})
               </div>
