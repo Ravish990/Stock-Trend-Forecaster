@@ -161,14 +161,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectStock, onNavigateT
         <MetricCard
           label="Predicted UP"
           value={summary?.predicted_up_count ?? 467}
-          subvalue={`${upPct}% of Universe`}
+          subvalue={`${upPct}%`}
           trend="up"
           icon={TrendingUp}
         />
         <MetricCard
           label="Predicted DOWN"
           value={summary?.predicted_down_count ?? 4}
-          subvalue={`${downPct}% of Universe`}
+          subvalue={`${downPct}%`}
           trend="down"
           icon={TrendingDown}
         />
